@@ -1,0 +1,58 @@
+# ============================================================
+# Sentinel — .gitignore
+# ============================================================
+
+# --- Credentials (NEVER commit these) ---
+.env
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# --- Virtual environment ---
+venv/
+.venv/
+env/
+.env/
+
+# --- Data (logs and models can be large; exclude from git) ---
+data/logs/*.log
+data/logs/*.db
+data/models/*.joblib
+data/models/*.pkl
+data/models/model_registry.json
+
+# Keep the folder structure in git using .gitkeep files
+!data/logs/.gitkeep
+!data/models/.gitkeep
+
+# --- MaxMind database (large binary file, download separately) ---
+*.mmdb
+
+# --- Test / coverage output ---
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Packet captures (can be very large) ---
+*.pcap
+*.pcapng

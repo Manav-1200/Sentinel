@@ -1,0 +1,67 @@
+# ============================================================
+# Sentinel — Python Dependencies
+# ============================================================
+# This project intentionally does NOT use a virtual environment.
+# Packages that have an official Arch package are installed via
+# pacman (not pip), since pip-installing over pacman packages on
+# Arch can cause version conflicts and is generally discouraged.
+#
+# Step 1 — Install via pacman first:
+#   sudo pacman -S python-scapy nmap python-pip python-pandas python-numpy
+#
+# Step 2 — Install the rest via pip:
+#   pip install -r requirements.txt --break-system-packages
+#
+# (--break-system-packages is required on Arch when installing
+#  system-wide without a venv — this is expected and safe here.)
+#
+# Note: Scapy requires root privileges to capture packets.
+# Note: iptables commands require root privileges.
+#       Run Sentinel with: sudo python main.py
+# ============================================================
+
+# --- Packet capture ---
+# scapy is installed via pacman (python-scapy), NOT pip — do not add it here.
+# pyshark is intentionally omitted: it's unmaintained (last release 2021) and
+# Scapy alone covers everything we need for capture. Revisit only if a
+# specific later phase requires tshark-level protocol dissection.
+
+# --- Data processing ---
+# pandas and numpy are installed via pacman (python-pandas, python-numpy).
+# Arch's pacman builds are precompiled against your exact Python/GCC version,
+# which avoids source-build failures that pip hits on very new Python releases.
+# Do NOT add pandas/numpy here.
+
+# --- Machine learning ---
+scikit-learn>=1.5      # Isolation Forest (anomaly detection)
+xgboost>=2.1           # Supervised classifier (Phase 2)
+joblib>=1.4             # Model serialisation (save/load)
+
+# --- Config ---
+pyyaml>=6.0             # Read config.yaml
+python-dotenv>=1.0      # Load .env credentials
+
+# --- CLI output ---
+rich>=13.7               # Pretty terminal tables and live display
+
+# --- API / Dashboard (Phase 4) ---
+fastapi>=0.115
+uvicorn>=0.30
+websockets>=13.0
+
+# --- Alerting ---
+# (No extra deps needed for SMTP — uses Python's built-in smtplib)
+requests>=2.32           # Slack webhook, GeoIP API, HTTP alerts
+
+# --- GeoIP (offline fallback) ---
+geoip2>=4.8               # MaxMind GeoLite2 database reader
+
+# --- Scheduling (Phase 5) ---
+apscheduler>=3.10        # Nightly retraining scheduler
+
+# --- LLM (Phase 2) ---
+anthropic>=0.30           # Claude API for log analysis
+
+# --- Testing ---
+pytest>=8.2
+pytest-cov>=5.0           # Coverage reports

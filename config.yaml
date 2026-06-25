@@ -1,0 +1,205 @@
+# ============================================================
+# Sentinel — Central Configuration
+# ============================================================
+# All tunable parameters live here. Never hardcode values
+# in source files — always read from this config instead.
+# Credentials (SMTP passwords, API keys) go in .env, not here.
+# ============================================================
+
+# ------------------------------------------------------------
+# Network capture settings
+# ------------------------------------------------------------
+capture:
+  # Which network interfaces to capture on.
+  #
+  # Set to "auto" to automatically detect and monitor every active,
+  # non-loopback interface (WiFi, Ethernet, USB tethering, etc.) at
+  # once. This is the recommended default — it means Sentinel keeps
+  # working correctly even if you switch from WiFi to Ethernet, or
+  # plug in a second adapter.
+  #
+  # To monitor only specific interfaces instead, replace "auto" with
+  # a list, e.g.:
+  #   interfaces: ["wlo1", "enp2s0"]
+  #
+  # Run `ip link show` to see interface names on your machine.
+  interfaces: "auto"
+
+  # How long (in seconds) to accumulate packets before computing
+  # flow features and running detection. Shorter = more responsive
+  # but higher CPU. Longer = more stable features, higher latency.
+  window_seconds: 5
+
+  # Maximum number of active flows to track simultaneously.
+  # Older flows are evicted when this limit is hit.
+  max_active_flows: 10000
+
+  # How long (in seconds) an idle flow is kept before it is
+  # considered finished and sent to feature extraction.
+  flow_timeout_seconds: 30
+
+# ------------------------------------------------------------
+# Detection settings
+# ------------------------------------------------------------
+detection:
+  # Number of flows to collect silently on startup before
+  # flagging anomalies. Gives the model a baseline of normal
+  # traffic before it starts alerting.
+  warmup_flows: 30
+
+  # Isolation Forest contamination parameter (0.0 – 0.5).
+  # Rough estimate of the fraction of traffic that is malicious.
+  # Start at 0.01 (1%) and tune based on your false-positive rate.
+  contamination: 0.01
+
+  # Anomaly score thresholds (raw Isolation Forest score).
+  # Scores are negative: closer to 0 = more anomalous.
+  #
+  # Set from real score distributions observed during Phase 1 testing
+  # (June 2026), AFTER applying the constant-column-filtering fix
+  # documented in detection/anomaly.py (see MIN_FEATURE_VARIANCE and
+  # N_ESTIMATORS there for the full evidence and reasoning):
+  #   - Normal traffic (including normal ping bursts): as low as
+  #     -0.013 at the 1st percentile in testing.
+  #   - A genuine 4000-packet ICMP flood (zero packet loss, confirmed
+  #     via real capture): -0.0136 — still NOT clearly separated from
+  #     normal traffic's noise floor even after the fix.
+  #   - A simulated SYN port scan: around -0.115 — very clearly
+  #     separated, comfortably past either threshold.
+  #
+  # KNOWN LIMITATION — confirmed via direct testing, partially
+  # improved, not fully solved (see detection/anomaly.py docstring and
+  # PHASES.md Phase 5 backlog for full details):
+  # Flood-style attacks (very high packet rate, very uniform low
+  # inter-arrival time) remain only weakly separable from normal
+  # traffic with the current feature set and Isolation Forest
+  # approach, even after removing constant features and increasing
+  # n_estimators (which together roughly doubled the separation, but
+  # not enough to clear a safe threshold without unacceptable false
+  # positives on normal bursty traffic). Port-scan-style attacks
+  # (high SYN ratio, zero payload) are detected very reliably and are
+  # unaffected by this limitation. A dedicated rate-based detector
+  # (e.g. a simple packets-per-second threshold check, separate from
+  # the general-purpose Isolation Forest) is the most promising next
+  # step for flood detection specifically — tracked as a Phase 3/5
+  # backlog item rather than solved here, since it is a different
+  # detection mechanism, not a tuning tweak.
+  thresholds:
+    suspicious: -0.015   # Score below this → SUSPICIOUS (log + monitor)
+    attack: -0.05          # Score below this → ATTACK (block + alert)
+
+  # Minimum number of labelled samples required before the
+  # supervised classifier (XGBoost) is enabled.
+  # Below this count, only the anomaly detector runs.
+  min_classifier_samples: 1000
+
+  # Number of suspicion events from the same IP within this
+  # time window (seconds) before escalating to a block.
+  repeat_offender_count: 3
+  repeat_offender_window_seconds: 3600  # 1 hour
+
+# ------------------------------------------------------------
+# Response settings
+# ------------------------------------------------------------
+response:
+  # Master switch. Set to true during development to log what
+  # WOULD be blocked without actually running iptables commands.
+  dry_run: true
+
+  # How long (in minutes) a blocked IP stays blocked before
+  # the rule is automatically removed.
+  block_duration_minutes: 60
+
+  # IPs that will NEVER be blocked regardless of score.
+  # Always include your router gateway and any trusted machines.
+  whitelist_ips:
+    - "127.0.0.1"
+    - "::1"
+    - "192.168.1.1"   # <-- replace with your router IP
+
+  # Block private/LAN IP ranges? Almost always false unless
+  # you are specifically hunting for insider threats on the LAN.
+  block_private_ranges: false
+
+# ------------------------------------------------------------
+# Alerting settings
+# ------------------------------------------------------------
+alerting:
+  # Set to true to send a test alert on startup and verify
+  # that your alert channels are configured correctly.
+  test_on_startup: false
+
+  # Minimum seconds between alerts for the same source IP.
+  # Prevents alert storms when one IP probes repeatedly.
+  rate_limit_seconds: 600  # 10 minutes
+
+  # Enable/disable individual channels.
+  # Credentials for each channel go in .env (see .env.example).
+  email:
+    enabled: false
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    sender: ""       # Set in .env: SENTINEL_EMAIL_SENDER
+    recipient: ""    # Set in .env: SENTINEL_EMAIL_RECIPIENT
+
+  slack:
+    enabled: false
+    # Set webhook URL in .env: SENTINEL_SLACK_WEBHOOK
+
+  webhook:
+    enabled: false
+    # Set URL in .env: SENTINEL_WEBHOOK_URL
+
+# ------------------------------------------------------------
+# GeoIP settings
+# ------------------------------------------------------------
+geoip:
+  # Primary lookup method: "api" uses ip-api.com (free, online).
+  # "maxmind" uses a local GeoLite2 database (offline, faster).
+  method: "api"
+
+  # Path to MaxMind GeoLite2 database file (only used if method = "maxmind").
+  maxmind_db_path: "data/GeoLite2-City.mmdb"
+
+  # How many resolved IPs to keep in memory to avoid re-querying.
+  cache_size: 1000
+
+# ------------------------------------------------------------
+# Logging and storage
+# ------------------------------------------------------------
+storage:
+  # SQLite database for all flow logs and labelled samples.
+  db_path: "data/logs/sentinel.db"
+
+  # Plain-text JSON-lines log for detections (one JSON object per line).
+  detections_log: "data/logs/detections.log"
+
+  # Plain-text JSON-lines log for block/unblock actions.
+  blocks_log: "data/logs/blocks.log"
+
+  # Training history log.
+  training_log: "data/logs/training_history.log"
+
+# ------------------------------------------------------------
+# Model storage
+# ------------------------------------------------------------
+models:
+  # Directory where trained model files are saved.
+  model_dir: "data/models"
+
+  # How many historical model versions to keep before deleting old ones.
+  keep_versions: 5
+
+# ------------------------------------------------------------
+# Dashboard / API settings
+# ------------------------------------------------------------
+dashboard:
+  # Port the FastAPI backend listens on.
+  api_port: 8000
+
+  # Set a long random string here (or in .env: SENTINEL_API_KEY).
+  # All dashboard API requests must include this key.
+  api_key: ""
+
+  # How many recent flows to return from /api/flows/recent.
+  recent_flows_limit: 100

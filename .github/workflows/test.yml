@@ -1,0 +1,40 @@
+# ============================================================
+# Sentinel — GitHub Actions CI
+# ============================================================
+# Runs all tests on every push and pull request.
+# Badge URL for README:
+#   https://github.com/Manav-1200/sentinel/actions/workflows/test.yml/badge.svg
+
+name: Tests
+
+on:
+  push:
+    branches: [ "main", "dev" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ -v --cov=. --cov-report=term-missing
+
+      - name: Enforce minimum coverage (70%)
+        run: |
+          pytest tests/ --cov=. --cov-fail-under=70
