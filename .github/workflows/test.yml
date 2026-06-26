@@ -29,6 +29,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # scapy is deliberately NOT in requirements.txt — on Arch
+          # Linux (the primary dev environment for this project) it's
+          # installed via pacman instead, since pip's scapy wheels
+          # didn't support Python 3.14 at time of writing. GitHub's
+          # Ubuntu runner has no pacman and uses Python 3.11 (set
+          # above), where pip-installing scapy works fine — so it's
+          # installed here, in CI only, as a normal pip package.
+          pip install scapy
           pip install -r requirements.txt
 
       - name: Run tests with coverage
