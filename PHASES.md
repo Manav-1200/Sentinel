@@ -14,14 +14,14 @@
 
 ## Quick reference — phase overview
 
-| Phase | Name | Core deliverable | Portfolio label |
-|-------|------|-----------------|-----------------|
-| 1 | Foundation | Packet capture + feature extraction + anomaly detection (CLI) | Project 1 |
-| 2 | Intelligence | Supervised ML + LLM log analysis + self-labelling pipeline | Project 1 v2 |
-| 3 | Response | Auto-blocking (iptables) + GeoIP + alerting | Project 2 |
-| 4 | Dashboard | Live web dashboard with world map + real-time feed | Project 2 v2 |
-| 5 | Production | Auto-retraining pipeline + model versioning + hardening | Project 3 |
-| 6 | Extras | Ideas to add during development (add freely) | — |
+| Phase | Name | Core deliverable | Portfolio label | Status |
+|-------|------|-----------------|-----------------|--------|
+| 1 | Foundation | Packet capture + feature extraction + anomaly/flood/DDoS detection (CLI) | Project 1 | ✅ Complete — 43 passing tests |
+| 2 | Intelligence | Supervised ML + LLM log analysis + self-labelling pipeline | Project 1 v2 | Not started |
+| 3 | Response | Auto-blocking (iptables) + GeoIP + alerting | Project 2 | Not started |
+| 4 | Dashboard | Live web dashboard with world map + real-time feed | Project 2 v2 | Not started |
+| 5 | Production | Auto-retraining pipeline + model versioning + hardening | Project 3 | Not started |
+| 6 | Extras | Ideas to add during development (add freely) | — | Ongoing |
 
 ---
 
@@ -33,8 +33,8 @@
 
 ### 1.1 — Project scaffold
 
-- [ ] Create GitHub repo: `sentinel`
-- [ ] Set up Python virtual environment (`venv` or `conda`)
+- [x] Create GitHub repo: `sentinel`
+- [x] **Decision (deviates from original plan):** no Python virtual environment — system Python + pacman-managed packages (Arch-specific), since the end goal is a system-installable CLI/desktop tool, not an isolated dev sandbox. See `requirements.txt` header and `PHASES.md` Phase 6 environment notes for the full reasoning.
 - [ ] Create folder structure:
   ```
   project-root/
@@ -64,7 +64,7 @@
 - [x] Handle TCP, UDP, and ICMP separately — each parsed for its correct fields (ports for TCP/UDP, no ports for ICMP); other IP protocols (GRE, ESP, etc.) are skipped for now
 - [ ] Write `capture/pcap_reader.py` — reads `.pcap` files for offline testing (not yet built — deferred until needed for Phase 1.3 testing or CI)
 - [x] Implement graceful shutdown on `Ctrl+C` — flushes all remaining active flows (not just the current window) before exiting, verified working
-- [ ] Write formal `pytest` unit tests in `tests/` (verified manually via `test_sniffer_manual.py` against real live traffic instead — formal automated tests still to do, see Phase 1.6/5.5)
+- [x] Write formal `pytest` unit tests in `tests/` — `tests/test_sniffer.py` (11 tests covering flow key symmetry, bidirectional assembly, TCP FIN/RST closing, UDP/ICMP grouping, flow-limit eviction). Verified passing on real hardware (Arch Linux, Python 3.14.6, pytest 9.1.1).
 
 **Extra hardening added beyond the original plan:**
 - [x] `_enforce_flow_limit()` — evicts the oldest flow when `max_active_flows` is hit, protecting against memory exhaustion during a flood-style attack
@@ -75,61 +75,93 @@
 
 ### 1.3 — Feature extraction module (`features/`)
 
-- [ ] Write `features/extractor.py` — takes a completed flow and computes the following features:
+- [x] Write `features/extractor.py` — takes a completed flow and computes the following features:
 
   **Flow-level features (computed per bidirectional flow):**
-  - Flow duration (microseconds)
-  - Total bytes forward / backward
-  - Total packets forward / backward
-  - Mean / max / min / std of packet length (forward and backward)
-  - Mean / max / min / std of inter-arrival time (IAT) between packets
-  - Forward / backward header length
-  - Bytes per second, packets per second
-  - Flow bytes per second, flow packets per second
+  - [x] Flow duration (seconds — used seconds instead of microseconds for readability; trivially convertible if microsecond precision is ever needed)
+  - [x] Total bytes forward / backward
+  - [x] Total packets forward / backward
+  - [x] Mean / max / min / std of packet length (forward and backward)
+  - [x] Mean / max / min / std of inter-arrival time (IAT) between packets
+  - [ ] Forward / backward header length (not yet added as a standalone feature — header size is currently only used internally to derive payload size; can add as explicit features later if the model needs it)
+  - [x] Bytes per second, packets per second
 
   **Flag-based features (TCP only):**
-  - Count of SYN, ACK, FIN, RST, PSH, URG flags in forward and backward directions
-  - SYN flag ratio (SYN count / total packets) — high values suggest port scans
+  - [x] Count of SYN, ACK, FIN, RST, PSH, URG flags — note: counted across the whole flow rather than split forward/backward, since for scan/flood detection the *total* SYN ratio matters most; can split by direction later if evaluation shows it's needed
+  - [x] SYN flag ratio (SYN count / total TCP packets) — verified: scored 1.0 on a simulated SYN scan vs 0.22 on a normal handshake
 
   **Port/protocol features:**
-  - Source port, destination port
-  - Protocol number (6=TCP, 17=UDP, 1=ICMP)
-  - Is destination a well-known port (< 1024)? (boolean)
+  - [x] Source port, destination port (kept as identity fields for logging/blocking — see note below)
+  - [x] Protocol number (6=TCP, 17=UDP, 1=ICMP)
+  - [x] Is destination a well-known port (< 1024)? (boolean)
 
   **Payload features:**
-  - Average payload size (total payload bytes / total packets)
-  - Ratio of packets with zero payload (pure ACKs have no payload — high ratio is unusual in attack traffic)
+  - [x] Average payload size (total payload bytes / total packets)
+  - [x] Ratio of packets with zero payload — verified: scored 1.0 on simulated SYN scan (no payload at all) vs 0.0 on normal HTTPS traffic
 
-- [ ] Output: a Python dict or pandas row per flow — this is what the model receives
-- [ ] Write `features/normaliser.py` — `StandardScaler` wrapper that fits on the first N flows and then transforms all subsequent flows
-- [ ] Write unit tests: given a synthetic flow dict, assert that all expected features are present and within sensible ranges
+- [x] Output: a Python dict per flow (chosen over pandas row — zero overhead per call, trivially convertible to a DataFrame/array later only when the ML layer actually needs it)
+- [ ] Write `features/normaliser.py` — `StandardScaler` wrapper (deferred to Phase 1.4, since normalisation is tightly coupled with the anomaly detector's training process — makes more sense to build alongside `detection/anomaly.py`)
+- [x] Testing: verified via two synthetic flows (normal HTTPS handshake + simulated SYN scan) with hand-checked feature values, AND verified against real live traffic (ICMP ping, DNS, mDNS, SSDP) on real hardware. Formal `pytest` unit tests still deferred to Phase 1.6/5.5 alongside the sniffer tests.
 
-### 1.4 — Anomaly detection module (`detection/`)
+**Design note:** `src_ip`/`dst_ip`/`src_port`/`dst_port` are included in the extracted dict as identity fields, but are explicitly NOT meant to be fed into the model as training features — the model should learn behavioural patterns (timing, ratios, sizes), not memorise specific addresses. This distinction will matter when we build the anomaly detector's input pipeline in 1.4 — identity fields get stripped out right before `.fit()`/`.predict()`, but stay in the dict for logging, alerting, and blocking decisions downstream.
 
-- [ ] Write `detection/anomaly.py` — wraps `sklearn.ensemble.IsolationForest`
-- [ ] Implement `AnomalyDetector` class with methods:
-  - `fit(X)` — trains on a batch of flow feature vectors
-  - `predict(x)` — returns anomaly score (-1 = anomaly, 1 = normal) and a raw score float
-  - `save(path)` / `load(path)` — persists the model with `joblib`
-- [ ] Cold-start strategy: on first run, collect 500 flows silently (warm-up period) before starting to flag anomalies — avoids false positives on startup
-- [ ] Configurable contamination parameter in `config.yaml` (default 0.01 = expect 1% of traffic to be anomalous)
-- [ ] Write unit tests: feed the model 200 obviously-normal flows, then feed 10 synthetic attack-like flows (very high packet rate, all SYN flags), assert the attacks score more anomalous
+**Verified on real hardware:** hand-checked synthetic test correctly distinguished a normal TCP handshake from a simulated SYN scan across every relevant feature (`syn_ratio`, `zero_payload_ratio`, `iat_std`, `packets_per_second`). Real traffic test (ICMP, UDP/DNS, mDNS, SSDP) produced sensible, hand-verifiable numbers — e.g. a 5-ping ICMP exchange correctly computed as 10 packets, ~4.03s duration, pps matching the ping command's own reported timing.
 
-### 1.5 — CLI output and logging (`main.py`)
+### 1.4 — Anomaly detection module (`detection/`) ✅ COMPLETE (verified on real attack traffic, real false-positive testing, and 9 passing pytest tests)
 
-- [ ] Wire capture → features → detection in `main.py`
-- [ ] Use the `rich` library to display a live table in the terminal:
-  - Columns: timestamp, src IP, dst IP, dst port, protocol, anomaly score, verdict (NORMAL / SUSPICIOUS / ATTACK)
-  - Color-code rows: green for normal, yellow for suspicious (score between threshold and threshold+0.1), red for attack
-- [ ] Write all flagged flows to `data/logs/detections.log` (JSON lines format — one JSON object per line, easy to parse later)
-- [ ] Print a summary every 60 seconds: flows processed, anomalies flagged, top flagging source IPs
+- [x] Write `detection/anomaly.py` — wraps `sklearn.ensemble.IsolationForest`
+- [x] Implement `AnomalyDetector` class with methods:
+  - `predict(x)` — returns a `DetectionResult` (verdict + raw score + original features) — chosen over a bare tuple so downstream code (display, logging) doesn't need to know about score internals
+  - `save(path)` / `load(path)` — persists the model with `joblib`, verified with a real save/load round-trip test producing bit-identical scores
+- [x] Cold-start strategy: collects `warmup_flows` (default 500, configurable) silently before flagging anything — verified both via pytest and live testing (correctly stayed `WARMING_UP` until exactly the threshold, then trained automatically)
+- [x] Configurable contamination parameter in `config.yaml`
+- [x] Write unit tests (`tests/test_anomaly.py`, 9 tests): warm-up lifecycle, normal-vs-attack scoring, save/load round-trip, flood-rate guard (see below)
+
+**Design decision — model does NOT keep learning after warm-up:** deliberately fixed after training, not continuously retrained on live traffic, to prevent an attacker slowly "teaching" the model their pattern is normal. Formal retraining is deliberately deferred to Phase 5, with evaluation/versioning/rollback.
+
+**Major real-world finding — constant-feature dilution (discovered and fixed during live testing):**
+While verifying detection against a real, captured ICMP flood (2000 pings via `ping -A`, generated from a Docker container to guarantee real network-interface traffic rather than loopback/hairpin paths), the flood scored only weakly anomalous (`-0.0068`) despite being an extreme statistical outlier (z-score >1000 on rate features). Root-caused via direct experimentation: constant/zero-variance features (e.g. all TCP flag counts are 0 on ICMP-only warm-up data) were diluting Isolation Forest's effective sensitivity, since random per-tree feature splits were frequently "wasted" on uninformative columns. **Fix, confirmed via measured before/after evidence:** constant columns are now excluded from the vector before fitting (`MIN_FEATURE_VARIANCE`), and `n_estimators` was increased from sklearn's default of 100 to 500. This roughly doubled score separation in testing, and is documented in detail directly in `detection/anomaly.py`'s docstring and `config.yaml`'s threshold comments.
+
+**Known, documented limitation — flood detection needed a second, explicit mechanism:** even after the fix above, the general-purpose Isolation Forest alone was not reliably catching flood-style traffic (very high, very uniform packet rate) without unacceptable false positives on normal bursty traffic. Rather than over-fit the general model to one attack pattern, a **dedicated, explicit flood-rate guard** (`FLOOD_PACKETS_PER_SECOND_THRESHOLD`, default 1000 pps) was added, running alongside the Isolation Forest — if a flow's rate exceeds this threshold, it's flagged `ATTACK` directly regardless of what the general model says. Verified: correctly flagged a real, captured 4000-packet flood, while NOT false-positiving on a simulated legitimate large file download at 500 pps.
+
+**Verified on real attack traffic (not just synthetic data):**
+- Port scan: `nmap -sS` from a Docker container (bridge network, to guarantee real-interface traffic — `127.0.0.1` and same-host-IP scans were found to hairpin and never reach the capture layer at all, a real Linux networking quirk documented for future reference) → correctly flagged `ATTACK` via the Isolation Forest itself.
+- Flood: 2000-ping flood from the same Docker setup → correctly flagged `ATTACK` via the explicit rate guard.
+- Normal traffic: real DNS/mDNS/SSDP/ICMP/HTTPS browsing traffic → correctly stayed `NORMAL` throughout every test session.
+
+### 1.4b — DDoS detection module (`detection/ddos_tracker.py`) — NOT in original plan, added after recognizing a real architectural gap
+
+**Why this exists:** while testing DoS (single-source flood) detection, it became clear that the per-flow architecture (Isolation Forest + flood-rate guard) can **structurally never detect a DDoS** — many distinct sources, each individually sending a low, unremarkable amount of traffic, only becomes alarming in aggregate. No single flow looks wrong on its own, so no per-flow mechanism, however well-tuned, can catch this pattern.
+
+- [x] Write `detection/ddos_tracker.py` — `GlobalRateTracker` class tracking flow arrivals (NOT individual packets) across ALL sources in a sliding time window
+- [x] Two-signal design: total flow rate AND distinct source count, both must exceed threshold together for `ATTACK` — this is what distinguishes a genuine multi-source DDoS from a single busy source (already handled by the per-flow flood guard) or a single organic burst of legitimate traffic
+- [x] Wired into `capture/sniffer.py` and `capture/pcap_reader.py` via an optional `on_new_flow` callback hook (keeps the capture layer fully decoupled from detection internals — it has no idea what DDoS detection is, it just calls an optional function once per new flow)
+- [x] Wired into `main.py` for both live capture and pcap replay
+- [x] CLI display shows a prominent system-wide warning banner (not a per-row indicator, since DDoS is a property of the whole network's current state, not any one flow)
+- [x] Write unit tests (`tests/test_ddos_tracker.py`, 7 tests) — the most important test directly proves the core design property: **identical total flow volume (600 flows) produces different verdicts depending on source diversity** (1 source → `SUSPICIOUS`, 30 sources → `ATTACK`)
+
+**Config:** `config.yaml`'s new `ddos:` section — `window_seconds`, `attack_total_flows_threshold`, `attack_distinct_sources_threshold`, and matching `suspicious_*` thresholds.
+
+### 1.5 — CLI output and logging (`main.py`) ✅ COMPLETE (verified end-to-end on real traffic)
+
+- [x] Wire capture → features → detection → display → logging → DDoS check, all in `main.py`, for both live capture (`run_live_capture`) and offline pcap replay (`run_pcap`)
+- [x] Use the `rich` library for a live-updating table (`detection/cli_display.py`):
+  - Columns: time, protocol, source, destination, packet count, score, verdict
+  - Color-coded: green=NORMAL, yellow=SUSPICIOUS, bold red=ATTACK, dim cyan=WARMING_UP
+  - **Beyond original plan:** also shows a running summary caption (total flows, per-verdict counts, dropped-packet count if non-zero) and a system-wide DDoS warning banner in the table title when an aggregate attack is detected
+- [x] Write flagged flows to `data/logs/detections.log` (JSON lines) via `detection/logger.py` — `SUSPICIOUS`/`ATTACK` logged by default, `NORMAL` optional via `log_normal` flag (logging every normal flow would be enormous, low-value noise)
+- [ ] Print a periodic 60-second summary (not yet built — the live caption already shows running totals continuously, which covers most of the same need; a periodic snapshot/digest log is a reasonable Phase 5 addition if needed)
+
+**Major real-world finding — packet capture throughput under load:** initial testing revealed that a fast burst (2000 pings in under a second) resulted in only ~5% of packets actually being captured — traced to kernel-level socket buffer overflow (Scapy's synchronous, single-threaded packet processing couldn't keep up with the burst, so the OS silently dropped packets before Python ever saw them). **Fixed via:** (1) decoupling capture from processing using a bounded queue + dedicated worker thread (`capture/sniffer.py`'s `FlowAssembler`/`PacketSniffer` split), so the capture callback does almost no work and the kernel socket gets drained as fast as possible; (2) increasing both the OS-level (`net.core.rmem_max`/`rmem_default` via `sysctl`) and Scapy-level (`conf.bufsize`) receive buffer sizes. Verified: went from capturing ~5% of a real flood's packets to **100%** (4000/4000, exact match) after the fix. Fully documented in `docs/performance.md`, including the exact sysctl commands needed on a fresh machine.
 
 ### 1.6 — Phase 1 wrap-up
 
-- [ ] Write a thorough `README.md` covering: what the project does, how to install, how to run, example output, known limitations
-- [ ] Record a short demo (even a terminal screen recording) showing the system detecting a simulated port scan (use `nmap -sS localhost` against yourself for a safe test)
-- [ ] Tag the repo: `git tag v1.0-anomaly-detection`
-- [ ] Push to GitHub — this is **Portfolio Project 1**
+- [x] `README.md` already covers install/run instructions, features, and project structure (written during scaffold phase, may benefit from a pass once Phase 1 screenshots/demo exist)
+- [ ] Record a short demo (terminal recording showing a real detected attack — we have the real data now, e.g. the Docker-based SYN scan and flood tests; recording is just packaging this for presentation)
+- [ ] Tag the repo: `git tag v1.0-anomaly-detection` (do this as part of the first push)
+- [ ] Push to GitHub — this is **Portfolio Project 1** — ready now, pending the actual `git push`
+
+**Refactor note (capture/sniffer.py):** core flow-assembly logic was extracted into a shared `FlowAssembler` base class, inherited by both `PacketSniffer` (live capture) and `PcapReader` (offline pcap replay) — added in 1.6 area but documented here since it touches both 1.2 and 1.6. This guarantees live and offline replay can never silently drift apart in how they interpret the same traffic, since they share the exact same code rather than two parallel implementations.
 
 ---
 

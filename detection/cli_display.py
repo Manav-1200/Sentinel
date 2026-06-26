@@ -25,6 +25,7 @@ from rich.live import Live
 from rich.table import Table
 
 from detection.anomaly import DetectionResult, Verdict
+from detection.ddos_tracker import DDoSCheckResult, DDoSVerdict
 
 
 # Colour mapping for each verdict — used consistently across the
@@ -69,6 +70,14 @@ class LiveDetectionDisplay:
         # docs/performance.md for what this means and how to fix it.
         self.dropped_packet_count = 0
 
+        # Current aggregate DDoS status, set via set_ddos_status().
+        # None means no DDoS check has run yet (e.g. still in warm-up).
+        # This is deliberately a SEPARATE, system-wide status — unlike
+        # individual flow rows, a DDoS verdict describes the overall
+        # state of the network right now, not any one flow, so it's
+        # shown prominently in the table title rather than as a row.
+        self._ddos_status: DDoSCheckResult | None = None
+
     def __enter__(self) -> "LiveDetectionDisplay":
         self._live = Live(self._render(), console=self._console, refresh_per_second=4)
         self._live.__enter__()
@@ -87,9 +96,20 @@ class LiveDetectionDisplay:
         if self._live is not None:
             self._live.update(self._render())
 
+    def set_ddos_status(self, ddos_result: DDoSCheckResult) -> None:
+        """
+        Update the current aggregate DDoS status and refresh the
+        display. Called by main.py only on verdict TRANSITIONS (not
+        every single flow) to avoid spamming re-renders — but it's
+        safe to call this every flow too, since rendering is cheap.
+        """
+        self._ddos_status = ddos_result
+        if self._live is not None:
+            self._live.update(self._render())
+
     def _render(self) -> Table:
         table = Table(
-            title="Sentinel — Live Flow Detection",
+            title=self._title(),
             caption=self._caption(),
             expand=True,
         )
@@ -118,6 +138,27 @@ class LiveDetectionDisplay:
             )
 
         return table
+
+    def _title(self) -> str:
+        base_title = "Sentinel — Live Flow Detection"
+
+        if self._ddos_status is None or self._ddos_status.verdict == DDoSVerdict.NORMAL:
+            return base_title
+
+        if self._ddos_status.verdict == DDoSVerdict.ATTACK:
+            style = "bold red"
+            label = "POSSIBLE DDoS IN PROGRESS"
+        else:
+            style = "yellow"
+            label = "ELEVATED AGGREGATE TRAFFIC"
+
+        return (
+            f"{base_title}   "
+            f"[{style}]\u26a0 {label} "
+            f"({self._ddos_status.total_flows_in_window} flows / "
+            f"{self._ddos_status.distinct_sources_in_window} sources "
+            f"in {self._ddos_status.window_seconds:.0f}s)[/{style}]"
+        )
 
     def _caption(self) -> str:
         base = (

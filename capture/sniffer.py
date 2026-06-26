@@ -202,9 +202,18 @@ class FlowAssembler:
     and when it's "finished" lives here, once.
     """
 
-    def __init__(self, flow_timeout: float, max_active_flows: int):
+    def __init__(self, flow_timeout: float, max_active_flows: int, on_new_flow=None):
         self.flow_timeout = flow_timeout
         self.max_active_flows = max_active_flows
+
+        # Optional callback invoked with (src_ip, timestamp) every time
+        # a brand new flow is created (NOT once per packet). This is
+        # how aggregate, cross-flow tracking (e.g. DDoS detection —
+        # see detection/ddos_tracker.py) observes flow creation events
+        # without FlowAssembler needing to know anything about what
+        # that tracking does. None is a valid value (no-op) — most
+        # tests and simple uses don't need this hook at all.
+        self.on_new_flow = on_new_flow
 
         # Active flows currently being assembled, keyed by FlowKey.
         self._active_flows: dict[FlowKey, Flow] = {}
@@ -280,6 +289,14 @@ class FlowAssembler:
                 self._enforce_flow_limit()
                 self._active_flows[flow_key] = flow
                 direction = "forward"
+
+                if self.on_new_flow is not None:
+                    # Notify any aggregate/cross-flow tracking (e.g.
+                    # DDoS detection) that a brand new flow has just
+                    # started. Called once per flow, not once per
+                    # packet — that distinction matters for accurate
+                    # rate tracking.
+                    self.on_new_flow(src_ip, timestamp)
             else:
                 # Determine direction relative to how the flow started.
                 direction = "forward" if (src_ip == flow.src_ip and src_port == flow.src_port) else "backward"
@@ -362,10 +379,11 @@ class PacketSniffer(FlowAssembler):
     the packet queue used to keep up with high packet rates.
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, on_new_flow=None):
         super().__init__(
             flow_timeout=float(config["capture"]["flow_timeout_seconds"]),
             max_active_flows=int(config["capture"]["max_active_flows"]),
+            on_new_flow=on_new_flow,
         )
         self.interfaces: list[str] = resolve_interfaces(config["capture"]["interfaces"])
 

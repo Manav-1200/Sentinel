@@ -45,7 +45,7 @@ detection:
   # Number of flows to collect silently on startup before
   # flagging anomalies. Gives the model a baseline of normal
   # traffic before it starts alerting.
-  warmup_flows: 30
+  warmup_flows: 500
 
   # Isolation Forest contamination parameter (0.0 – 0.5).
   # Rough estimate of the fraction of traffic that is malicious.
@@ -97,6 +97,31 @@ detection:
   # time window (seconds) before escalating to a block.
   repeat_offender_count: 3
   repeat_offender_window_seconds: 3600  # 1 hour
+
+# ------------------------------------------------------------
+# DDoS detection settings (aggregate, cross-source tracking)
+# ------------------------------------------------------------
+# This is intentionally separate from the per-flow anomaly detector
+# above. A per-flow detector (even with the flood-rate guard) can
+# never see a DDoS, where many different sources each send a low,
+# individually-unremarkable amount of traffic that only becomes
+# alarming in aggregate. See detection/ddos_tracker.py for the full
+# reasoning.
+ddos:
+  # How far back (in seconds) to look when computing aggregate rates.
+  window_seconds: 10.0
+
+  # ATTACK requires BOTH thresholds to be exceeded together — this
+  # is what distinguishes a real multi-source DDoS from a single busy
+  # source (which the per-flow flood-rate guard already handles) or
+  # a single organic burst of normal traffic.
+  attack_total_flows_threshold: 500
+  attack_distinct_sources_threshold: 20
+
+  # SUSPICIOUS fires if EITHER threshold alone is elevated — a softer
+  # early-warning signal, logged but not auto-blocked.
+  suspicious_total_flows_threshold: 200
+  suspicious_distinct_sources_threshold: 10
 
 # ------------------------------------------------------------
 # Response settings
