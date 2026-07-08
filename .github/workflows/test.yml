@@ -46,3 +46,4 @@ jobs:
       - name: Enforce minimum coverage (70%)
         run: |
           pytest tests/ --cov=. --cov-fail-under=70
+
