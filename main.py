@@ -1,6 +1,7 @@
 """
 Sentinel — Real-time Network Threat Detection and Response
 ==========================================================
+
 Main entry point. Parses CLI arguments and launches the
 appropriate mode: live capture, pcap replay, or labelling pass.
 
@@ -68,9 +69,44 @@ def print_banner(config: dict, mode: str) -> None:
     ))
 
 
+def try_train_classifier(config: dict):
+    """
+    Attempt to train the supervised classifier (detection/classifier.py)
+    from whatever LLM-labelled samples currently exist in the database.
+
+    Returns a trained AttackClassifier, or None if there isn't enough
+    labelled data yet (the caller is expected to fall back to
+    anomaly-detector-only behaviour in that case — this is the
+    expected, normal state for a while after Sentinel's first run).
+
+    Deliberately called ONCE at startup, not retrained mid-session —
+    formal, evaluated, versioned retraining is Phase 5's job. This is
+    just "is there enough data to bother training right now."
+    """
+    from detection.classifier import AttackClassifier
+    from pipeline.labeller import Labeller
+
+    labeller = Labeller(config, llm_analyser=None)  # No LLM needed — just reading existing samples
+    samples = labeller.fetch_all()
+
+    classifier = AttackClassifier(config)
+    try:
+        result = classifier.train(samples)
+    except ValueError as e:
+        console.print(f"[dim]Classifier not trained yet: {e}[/dim]\n")
+        return None
+
+    console.print(
+        f"[green]Classifier trained:[/green] {result.winning_model_name} "
+        f"(F1={result.winning_report.f1_macro:.3f}) on {result.total_samples_used} labelled samples.\n"
+    )
+    return classifier
+
+
 def run_live_capture(config: dict) -> None:
     """
     Start the live packet capture pipeline.
+
     Imports are deferred here so that --help and --label work
     without needing root or all heavy dependencies installed.
     """
@@ -83,6 +119,8 @@ def run_live_capture(config: dict) -> None:
     from detection.cli_display import LiveDetectionDisplay
     from detection.logger import DetectionLogger
     from detection.ddos_tracker import GlobalRateTracker, DDoSVerdict
+    from detection.llm_analyser import LLMAnalyser
+    from pipeline.labeller import Labeller
 
     print_banner(config, mode="live capture")
 
@@ -91,6 +129,14 @@ def run_live_capture(config: dict) -> None:
     extractor = FeatureExtractor(config)
     detector = AnomalyDetector(config)
     logger = DetectionLogger(config)
+    llm_analyser = LLMAnalyser(config)
+    labeller = Labeller(config, llm_analyser=llm_analyser)
+
+    # Attempt to train the supervised classifier from whatever labelled
+    # data already exists. classifier will be None if there isn't
+    # enough yet — completely normal for a while, the pipeline just
+    # falls back to anomaly-detector-only verdicts in that case.
+    classifier = try_train_classifier(config)
 
     console.print(f"[cyan]Warming up:[/cyan] collecting {config['detection']['warmup_flows']} "
                   f"flows before flagging anomalies...\n")
@@ -103,6 +149,9 @@ def run_live_capture(config: dict) -> None:
     # Tracks whether we've already printed a DDoS warning for the
     # CURRENT elevated period, so we don't spam the console once per
     # flow while an attack is ongoing — only on verdict transitions.
+    # Also gates process_ddos_attack() below for the same reason: a
+    # single aggregate ATTACK period should produce ONE stored
+    # training sample, not one per flow processed while it persists.
     last_ddos_verdict = DDoSVerdict.NORMAL
 
     try:
@@ -114,17 +163,56 @@ def run_live_capture(config: dict) -> None:
                     continue
                 result = detector.predict(features)
                 display.dropped_packet_count = sniffer.dropped_packet_count
-                display.add(result)
+
+                # If a trained classifier is available AND the anomaly
+                # detector already flagged this flow, ask the classifier
+                # for a specific attack-type prediction to show alongside
+                # the bare verdict. The classifier never overrides the
+                # anomaly detector's verdict — it only adds detail on
+                # top of an already-flagged flow (see main.py module
+                # docstring discussion / PHASES.md for why detection and
+                # classification stay as separate, composable layers).
+                predicted_label = None
+                if classifier is not None and result.verdict.value in ("SUSPICIOUS", "ATTACK"):
+                    try:
+                        predicted_label, _ = classifier.predict(features)
+                    except Exception:
+                        # A prediction failure (e.g. a feature the
+                        # classifier wasn't trained on) must never
+                        # interrupt the live pipeline — just skip
+                        # showing a predicted label for this flow.
+                        predicted_label = None
+
+                display.add(result, predicted_label=predicted_label)
                 logger.log(result)
+
+                # Self-labelling: only acts on SUSPICIOUS/ATTACK verdicts
+                # (see pipeline/labeller.py) — calls the LLM analyser
+                # (rate-limited, gracefully degrades on failure) and
+                # stores the result as a training sample for the
+                # future Phase 2 classifier. Runs after display/logging
+                # so a slow or failed LLM call never delays what the
+                # operator sees on screen.
+                labeller.process(result)
 
                 # Aggregate, cross-source DDoS check — runs independently
                 # of the per-flow verdict above. See detection/ddos_tracker.py
                 # for why this needs to be a separate mechanism entirely.
+                # A per-flow detector fundamentally cannot see this
+                # pattern (many distinct sources, each individually
+                # unremarkable) — so, unlike per-flow verdicts, a
+                # genuine aggregate ATTACK here is stored directly as
+                # its own training sample (no LLM confirmation needed
+                # — both of GlobalRateTracker's thresholds already had
+                # to be crossed together, which is itself deterministic
+                # evidence). Only done on the transition INTO ATTACK,
+                # not on every flow processed while it persists.
                 ddos_result = ddos_tracker.check(flow.last_seen)
                 if ddos_result.verdict != last_ddos_verdict:
                     display.set_ddos_status(ddos_result)
+                    if ddos_result.verdict == DDoSVerdict.ATTACK:
+                        labeller.process_ddos_attack(ddos_result)
                     last_ddos_verdict = ddos_result.verdict
-
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow] Flushing current window.")
         sniffer.stop()
@@ -139,6 +227,8 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     from detection.cli_display import LiveDetectionDisplay
     from detection.logger import DetectionLogger
     from detection.ddos_tracker import GlobalRateTracker, DDoSVerdict
+    from detection.llm_analyser import LLMAnalyser
+    from pipeline.labeller import Labeller
 
     print_banner(config, mode=f"pcap replay — {pcap_path}")
 
@@ -151,6 +241,9 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     extractor = FeatureExtractor(config)
     detector = AnomalyDetector(config)
     logger = DetectionLogger(config)
+    llm_analyser = LLMAnalyser(config)
+    labeller = Labeller(config, llm_analyser=llm_analyser)
+    classifier = try_train_classifier(config)
     display = LiveDetectionDisplay(max_rows=20)
 
     last_ddos_verdict = DDoSVerdict.NORMAL
@@ -161,12 +254,23 @@ def run_pcap(config: dict, pcap_path: str) -> None:
             if features is None:
                 continue
             result = detector.predict(features)
-            display.add(result)
+
+            predicted_label = None
+            if classifier is not None and result.verdict.value in ("SUSPICIOUS", "ATTACK"):
+                try:
+                    predicted_label, _ = classifier.predict(features)
+                except Exception:
+                    predicted_label = None
+
+            display.add(result, predicted_label=predicted_label)
             logger.log(result)
+            labeller.process(result)
 
             ddos_result = ddos_tracker.check(flow.last_seen)
             if ddos_result.verdict != last_ddos_verdict:
                 display.set_ddos_status(ddos_result)
+                if ddos_result.verdict == DDoSVerdict.ATTACK:
+                    labeller.process_ddos_attack(ddos_result)
                 last_ddos_verdict = ddos_result.verdict
 
     console.print("[green]Pcap replay complete.[/green]")
@@ -174,19 +278,68 @@ def run_pcap(config: dict, pcap_path: str) -> None:
 
 def run_label(config: dict) -> None:
     """
-    Phase 2: Run the labelling pass on today's detection logs.
-    Reads detections.log, calls the LLM analyser on suspicious flows,
-    and writes labelled samples to the SQLite database.
+    Prints a summary of labelled samples accumulated so far in the
+    SQLite database — useful for checking progress toward having
+    enough training data for the Phase 2 classifier.
+
+    Note: this does NOT run a separate labelling pass over old logs.
+    Labelling now happens automatically, live, during normal capture
+    (see run_live_capture/run_pcap) — every SUSPICIOUS/ATTACK flow is
+    labelled as it's detected, via pipeline/labeller.py. This command
+    is just a read-only summary of what's accumulated so far.
     """
-    # Imported here — this module does not exist until Phase 2.
-    from pipeline.labeller import Labeller  # noqa: F401  (built in Phase 2)
-    print_banner(config, mode="labelling pass")
-    console.print("[yellow]Labelling pipeline not yet implemented — coming in Phase 2.[/yellow]")
+    from pipeline.labeller import Labeller
+
+    print_banner(config, mode="label summary")
+
+    labeller = Labeller(config, llm_analyser=None)  # No LLM needed — read-only summary
+    counts = labeller.count_by_label()
+    source_counts = labeller.count_by_label_source()
+
+    if not counts:
+        console.print("[yellow]No labelled samples yet.[/yellow] "
+                       "Run live capture or pcap replay to start accumulating labelled data.")
+        return
+
+    total = sum(counts.values())
+    usable = source_counts.get("llm", 0) + source_counts.get("ddos_tracker", 0)
+
+    console.print(f"[cyan]Total stored samples:[/cyan] {total}")
+    console.print(
+        f"[cyan]Usable for classifier training (label_source='llm' or 'ddos_tracker'):[/cyan] {usable} "
+        f"({usable / total * 100:.1f}% of total)\n"
+    )
+
+    console.print("[bold]By label:[/bold]")
+    for label, count in sorted(counts.items(), key=lambda x: -x[1]):
+        console.print(f"  {label:<20} {count}")
+
+    console.print()
+    console.print("[bold]By label source:[/bold]")
+    source_descriptions = {
+        "llm": "a real LLM judgment — usable for classifier training",
+        "ddos_tracker": "a deterministic aggregate DDoS finding — usable for classifier training",
+        "auto": "score didn't meet llm.min_score_for_analysis — never sent to the LLM",
+        "llm_failed": "LLM call attempted but failed (timeout/rate limit/error)",
+    }
+    for source, count in sorted(source_counts.items(), key=lambda x: -x[1]):
+        description = source_descriptions.get(source, "")
+        console.print(f"  {source:<12} {count:<8} [dim]{description}[/dim]")
+
+    if usable < total * 0.1:
+        console.print(
+            "\n[yellow]Note:[/yellow] Less than 10% of stored samples have a real, usable "
+            "label. This usually means most flows aren't crossing "
+            "llm.min_score_for_analysis — check detection/anomaly.py scoring is "
+            "behaving as expected (see the constant-column-filter safety floor added "
+            "June 2026), or consider lowering llm.min_score_for_analysis in config.yaml."
+        )
 
 
 def run_train(config: dict) -> None:
     """Phase 5: Manually trigger a retraining run."""
     from pipeline.trainer import Trainer  # noqa: F401  (built in Phase 5)
+
     print_banner(config, mode="manual retraining")
     console.print("[yellow]Retraining pipeline not yet implemented — coming in Phase 5.[/yellow]")
 
@@ -202,7 +355,6 @@ def main() -> None:
         prog="sentinel",
         description="Sentinel — Real-time network threat detection and response."
     )
-
     parser.add_argument(
         "--interface", "-i",
         type=str,
@@ -251,6 +403,7 @@ def main() -> None:
     # CLI flags override config.yaml values
     if args.dry_run:
         config["response"]["dry_run"] = True
+
     if args.interface:
         if args.interface.strip().lower() == "auto":
             config["capture"]["interfaces"] = "auto"

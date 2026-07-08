@@ -60,7 +60,12 @@ geoip2>=4.8               # MaxMind GeoLite2 database reader
 apscheduler>=3.10        # Nightly retraining scheduler
 
 # --- LLM (Phase 2) ---
-anthropic>=0.30           # Claude API for log analysis
+# --- LLM (Phase 2) ---
+# openai client is used for NVIDIA NIM (default provider — NIM exposes
+# an OpenAI-compatible API at integrate.api.nvidia.com). anthropic is
+# kept as an optional alternative provider — see detection/llm_analyser.py.
+openai>=1.40
+anthropic>=0.30           # optional alternative provider, not required by default
 
 # --- Testing ---
 pytest>=8.2

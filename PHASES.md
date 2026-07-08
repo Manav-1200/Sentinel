@@ -17,7 +17,7 @@
 | Phase | Name | Core deliverable | Portfolio label | Status |
 |-------|------|-----------------|-----------------|--------|
 | 1 | Foundation | Packet capture + feature extraction + anomaly/flood/DDoS detection (CLI) | Project 1 | ✅ Complete — 43 passing tests |
-| 2 | Intelligence | Supervised ML + LLM log analysis + self-labelling pipeline | Project 1 v2 | Not started |
+| 2 | Intelligence | Supervised ML + LLM log analysis + self-labelling pipeline | Project 1 v2 | ✅ Core loop proven end-to-end (detection → LLM labelling → classifier training). Wrap-up (README, docs, tag) remaining. |
 | 3 | Response | Auto-blocking (iptables) + GeoIP + alerting | Project 2 | Not started |
 | 4 | Dashboard | Live web dashboard with world map + real-time feed | Project 2 v2 | Not started |
 | 5 | Production | Auto-retraining pipeline + model versioning + hardening | Project 3 | Not started |
@@ -129,7 +129,7 @@ While verifying detection against a real, captured ICMP flood (2000 pings via `p
 - Flood: 2000-ping flood from the same Docker setup → correctly flagged `ATTACK` via the explicit rate guard.
 - Normal traffic: real DNS/mDNS/SSDP/ICMP/HTTPS browsing traffic → correctly stayed `NORMAL` throughout every test session.
 
-### 1.4b — DDoS detection module (`detection/ddos_tracker.py`) — NOT in original plan, added after recognizing a real architectural gap
+### 1.4b — DDoS detection module (`detection/ddos_tracker.py`) ✅ COMPLETE (NOT in original plan, added after recognizing a real architectural gap — verified via 7 passing pytest tests)
 
 **Why this exists:** while testing DoS (single-source flood) detection, it became clear that the per-flow architecture (Isolation Forest + flood-rate guard) can **structurally never detect a DDoS** — many distinct sources, each individually sending a low, unremarkable amount of traffic, only becomes alarming in aggregate. No single flow looks wrong on its own, so no per-flow mechanism, however well-tuned, can catch this pattern.
 
@@ -171,55 +171,110 @@ While verifying detection against a real, captured ICMP flood (2000 pings via `p
 
 **Why this matters:** Moving from unsupervised to supervised learning is a huge step — it demonstrates that you understand the full ML lifecycle, not just running a model.
 
-### 2.1 — Self-labelling pipeline (`pipeline/labeller.py`)
+### 2.1 — Self-labelling pipeline (`pipeline/labeller.py`) ✅ COMPLETE (verified on real traffic, real attack traffic, and multiple real bugs found + fixed)
 
-- [ ] Write `pipeline/labeller.py` — reads `detections.log` and auto-labels flows:
-  - Anomaly score below threshold → label `BENIGN`
-  - Anomaly score above threshold → send to LLM analyser for confirmation (see 2.2)
-  - LLM says attack → label with attack type (e.g. `PORTSCAN`, `DOSATTEMPT`, `BRUTEFORCE`)
-  - LLM unsure → label `UNKNOWN` (skip for training, review manually)
-- [ ] Store labelled flows in SQLite database (`data/logs/flows.db`) with schema:
-  ```
-  flows table:
-    id, timestamp, src_ip, dst_ip, dst_port, protocol,
-    anomaly_score, label, label_source (auto/llm/manual),
-    all 30+ feature columns
-  ```
-- [ ] Write a CLI command `python main.py --label` that runs the labelling pass on today's logs
+- [x] Write `pipeline/labeller.py` — reads live detection results and auto-labels flows:
+  - Anomaly score below `llm.min_score_for_analysis` → stored directly, `label_source="auto"`, no LLM call (saves LLM usage for flows that need it most)
+  - Anomaly score above threshold, OR detector already said ATTACK → sent to the LLM analyser (see 2.2)
+  - LLM confirms a real attack type with high/medium confidence → stored with that label, `label_source="llm"` — **and promotes the stored verdict to ATTACK** if the flow only arrived as SUSPICIOUS (see verdict-conflation fix below)
+  - LLM says `benign`/`unknown`, or low confidence → stored as-is, never promotes a verdict
+  - LLM call fails for any reason → stored with `label="unknown"`, `label_source="llm_failed"` — never silently dropped
+- [x] Store labelled flows in SQLite (`data/logs/sentinel.db`, `labelled_flows` table) — schema includes indexed columns (`src_ip`, `dst_port`, `total_packets`, etc.) plus a full `all_features` JSON column for everything else
+- [x] `count_by_label()` / `count_by_label_source()` / `fetch_all()` query helpers for classifier training and manual inspection
+- [x] `python main.py --label` prints a read-only summary of accumulated samples (total, by label, by source, with a warning if usable-sample percentage is low)
+- [x] Aggregate DDoS detections (see 1.4b) are stored as real training samples too via `Labeller.process_ddos_attack()`, `label_source="ddos_tracker"`, no LLM confirmation needed (already deterministic evidence)
 
-### 2.2 — LLM log analyser (`detection/llm_analyser.py`)
+**Real bug found and fixed — LLM never actually called on flood-guard ATTACK flows:**
+- Problem: `process()`'s original gate only checked `should_analyse(result.score)` (a pure score threshold).
+- Flood-guard-triggered ATTACK verdicts can carry a perfectly ordinary Isolation Forest score (the guard overrides on packet rate, not score) — so these flows silently skipped the LLM entirely and piled up as `label_source="auto"`.
+- Fix: the gate now also fires whenever `result.verdict == Verdict.ATTACK`, independent of score.
 
-- [ ] Write `detection/llm_analyser.py` — calls Claude API with a structured prompt
-- [ ] For each suspicious flow, build a prompt that includes:
-  - The raw feature values in human-readable form (e.g. "2000 SYN packets in 3 seconds from 192.168.1.50 to port 22")
-  - Ask: is this a known attack pattern? If yes, what type? Confidence level? Why?
-- [ ] Parse the response and extract: `attack_type`, `confidence` (high/medium/low), `reasoning` (one sentence)
-- [ ] Store the reasoning in the database — this becomes a human-readable audit trail, which is genuinely impressive in a portfolio
-- [ ] Rate-limit LLM calls: only call for flows with anomaly score above a higher secondary threshold — don't burn API tokens on borderline cases
-- [ ] Write unit tests using mocked API responses
+**Major real-world finding — verdict conflation caused frequent false ATTACK flags on ordinary traffic:**
+- Problem: Isolation Forest's raw score was originally allowed to produce `ATTACK` directly (not just `SUSPICIOUS`) once negative enough.
+- Because `contamination` forces the model to always flag ~contamination% of flows as outliers *by construction*, completely ordinary traffic (a single DNS lookup, an mDNS broadcast) was regularly labelled `ATTACK` with no actual malicious behaviour behind it — confirmed via repeated live testing.
+- This matters beyond cosmetics: in a deployment where verdicts drive alerting or blocking, false ATTACK labels cause real alert fatigue and risk disrupting legitimate traffic.
+- Fix: `detection/anomaly.py`'s Isolation Forest path can now only ever produce `SUSPICIOUS` on its own. A stored `ATTACK` verdict requires either the deterministic flood-rate guard, or the LLM independently confirming a real attack pattern (`_REAL_ATTACK_TYPES`, medium+ confidence) — see `pipeline/labeller.py`'s verdict-promotion logic.
+- Known gap: this promotion updates what's *stored* for classifier training, but doesn't retroactively repaint the live terminal row already rendered before the LLM responds — a Phase 3 nice-to-have, not fixed here.
 
-### 2.3 — Supervised classifier (`detection/classifier.py`)
+**Real bug found and fixed — flood guard itself false-positived on tiny flows:**
+- Problem: a 2-packet flow with ~1ms between packets computes `packets_per_second` into the thousands purely from dividing by a near-zero duration, despite being completely ordinary traffic (e.g. a fast request/response pair). Confirmed live: a genuine 2-packet HTTPS flow was flagged `ATTACK` this way.
+- Fix: added `FLOOD_MIN_PACKETS` (20) — the flood-rate guard is now only evaluated once a flow has enough packets for a rate calculation to be meaningful.
 
-- [ ] Write `detection/classifier.py` — wraps XGBoost and Random Forest (train both, pick the better one per evaluation)
-- [ ] Implement `Classifier` class with:
-  - `train(X, y)` — trains on labelled flow data from the SQLite database
-  - `predict(x)` — returns predicted class label and probability scores for each class
-  - `evaluate(X_test, y_test)` — prints confusion matrix, precision, recall, F1 per class
-  - `save(path)` / `load(path)` — model persistence
-- [ ] Minimum training threshold: only train if the database has at least 1000 labelled samples with at least 3 distinct labels — log a warning and fall back to anomaly detection if below threshold
-- [ ] Once trained, run classifier in parallel with the anomaly detector. Final verdict logic:
-  - Both agree → high confidence verdict
-  - Disagree → flag as SUSPICIOUS, send to LLM analyser
-  - Only anomaly detector firing, no classifier yet → use anomaly score only
+**Real bug found and fixed — aggregate DDoS detections originally never reached the labelling pipeline at all:**
+- Problem: `detection/ddos_tracker.py`'s `GlobalRateTracker` has no single underlying flow to hand to `labeller.process()`. A real, deterministic aggregate ATTACK finding (both flow-rate and distinct-source thresholds crossed together) was previously only ever shown as a display banner, never stored as training data.
+- Fix: added `Labeller.process_ddos_attack()`, called from `main.py` on the transition into an aggregate ATTACK verdict — stores it directly with `label="ddos"`, `label_source="ddos_tracker"`, no LLM confirmation needed (the aggregate rule is already deterministic evidence, same philosophy as the flood guard).
 
-### 2.4 — Attack simulation for self-generated labels
+**Known, documented gap — port scans are currently invisible to every existing detector:**
+- A real `nmap -sT` scan was run against Sentinel during testing (one source, many distinct destination ports, low packets per flow).
+- Per-flow Isolation Forest correctly can't see it (each 2-packet flow to one port looks unremarkable in isolation) — expected, matches Phase 1's documented per-flow limitations.
+- `GlobalRateTracker` *also* can't see it: it tracks distinct **source** IPs for DDoS, not distinct **destination ports from one source**, which is a port scan's actual signature.
+- No fix implemented yet — needs a dedicated `PortScanTracker` (per-source, sliding-window, distinct-destination-port counting), architecturally a sibling to `GlobalRateTracker` rather than a tweak to it. Scoped as the next concrete item — see Phase 6 backlog.
 
-- [ ] Write `tests/attack_simulator.py` — generates synthetic attack traffic against localhost so you can populate your database with labelled examples fast:
-  - Port scan simulation: rapid TCP SYN packets to many ports
-  - Brute force simulation: many connection attempts to port 22 (SSH)
-  - DoS simulation: high-volume UDP flood to a test port
-  - Normal traffic simulation: mixed HTTP/DNS/random port traffic
-- [ ] **Safety note in code and README:** these simulations run against localhost only — never point at external IPs
+### 2.2 — LLM log analyser (`detection/llm_analyser.py`) ✅ COMPLETE (verified on real traffic, real attack traffic, provider outage handled, two real prompt bugs found + fixed)
+
+- [x] Write `detection/llm_analyser.py` — provider-agnostic (`nim` / `anthropic`), single `analyse()` call shape regardless of backend
+- [x] For each SUSPICIOUS/ATTACK flow, builds a plain-language prompt from the raw features (packet counts, rates, TCP flags, ports) rather than dumping raw JSON
+- [x] Parses response into `attack_type` (fixed vocabulary — `KNOWN_ATTACK_TYPES`), `confidence`, `reasoning`; malformed/unparseable responses become `available=False`, never a fabricated label
+- [x] Rate-limited (`_RateLimiter`, sliding 60s window) — protects free-tier quota from being exhausted during a real attack burst
+- [x] Every failure mode (timeout, auth error, malformed response, provider outage) degrades to `AnalysisResult(available=False, ...)` — never crashes the live capture loop
+
+**Real incident — NVIDIA NIM's 70B model hung indefinitely:**
+- `meta/llama-3.3-70b-instruct` (the originally configured model) stopped responding entirely — connections established, requests sent, zero bytes ever received back, confirmed via `curl -v` (TLS handshake fine, then nothing, even past a 2m43s manual timeout).
+- The smaller `meta/llama-3.1-8b-instruct` responded normally (~40ms) on the same account/key, confirming this was model-specific, not a key/network/account issue.
+- Mitigation: switched default `config.yaml` model to the 8B variant to unblock testing; 70B remains available to switch back to once confirmed recovered on NVIDIA's side.
+- This is an external provider issue, not a Sentinel bug — documented here for anyone hitting the same thing.
+
+**Major real-world finding #1 — prompt structure biased the LLM toward rubber-stamping the detector's verdict:**
+- Problem: the original prompt stated the detector's verdict ("This flow was flagged 'ATTACK'...") as fact, immediately before asking for a classification.
+- Confirmed via live testing: this measurably biased the (especially smaller, 8B) model toward confirming whatever the detector said, rather than reasoning independently — ordinary 2-4 packet DNS/mDNS/HTTPS flows were being labelled `port_scan`/`ddos`/`syn_flood` with **high confidence**, purely because the prompt handed the model a pre-formed conclusion to agree with.
+- Fix: rewrote `_build_prompt()` to present the detector's verdict *after* the raw features, explicitly framed as an unreliable, purely-statistical signal that "frequently misfires on ordinary traffic" — plus explicit skepticism guidance (a small number of packets to a standard service port is "virtually always benign, regardless of what the detector's verdict says").
+- Verified: the same borderline flows that previously came back `port_scan`/`ddos` now correctly come back `benign` with sound, feature-grounded reasoning.
+
+**Major real-world finding #2 — the fix above over-corrected, causing the LLM to under-call genuine, obvious floods:**
+- Problem: after the skepticism fix above, a REAL 35,716-packet, ~3,745 pkts/sec, fully one-directional UDP flood (generated deliberately — see 2.4) came back `unknown`, **low confidence**, with reasoning literally stating "the packet rate ... [is] not extreme" — despite being an unambiguous flood by any reasonable numeric standard.
+- Root cause: the 8B model had no concrete numeric anchor for what "extreme" means in packets/second, so it was guessing at scale rather than reasoning from a threshold — the same underlying issue as finding #1 (small models need explicit numeric anchors, not just qualitative language), just manifesting in the opposite direction.
+- Fix: added an explicit quantitative guidance paragraph to the prompt — sustained traffic over ~500-1000 pps for more than a couple of seconds, especially combined with all-forward/zero-backward traffic, is called out as a strong flood/DoS indicator on its own.
+- Verified: re-running the identical flood scenario afterward produced `ATTACK`, `ddos`, **high confidence**, with reasoning correctly citing the specific packet rate and one-directional pattern. This is the first fully-correct, high-confidence non-benign classification produced by the pipeline.
+
+### 2.3 — Supervised classifier (`detection/classifier.py`) ✅ COMPLETE (real bug found + fixed, verified training end-to-end on real multi-class data)
+
+- [x] Write `detection/classifier.py` — trains both RandomForest and XGBoost on `label_source` in `{"llm", "ddos_tracker"}` samples from the labeller's database, picks the winner by macro F1 (not accuracy — see module docstring for why)
+- [x] `try_train_classifier()` in `main.py` attempts training once at startup; falls back to anomaly-detector-only behaviour if there isn't enough usable data yet
+- [x] `MIN_DISTINCT_CLASSES` and `MIN_SAMPLES_PER_CLASS` gate training with clear, specific error messages rather than a confusing crash or a silently unreliable model
+- [x] Formal `evaluate()` output — `EvaluationReport` includes macro F1, full `classification_report`, and confusion matrix per candidate model, both winner and loser kept visible (not thrown away)
+
+**Real bug found and fixed — stratified train/test split crashed on small, multi-class sample counts:**
+- Problem: a fixed `test_size=0.2` split works fine at scale, but with e.g. 10 usable samples across 3 classes, a 20% test split is only 2 samples — not enough slots for scikit-learn's stratified split to guarantee at least one example of every class in the test set, which raises a hard error (`test_size should be greater or equal to the number of classes`) rather than proceeding unsafely.
+- Fix: the test-set size is now computed dynamically — large enough to guarantee at least one test example per class, capped so training still keeps at least one example of every class too. Classes with fewer than `MIN_SAMPLES_PER_CLASS` (2) examples are excluded from training entirely (with a clear message naming which classes and why) rather than attempting a meaningless split.
+- Verified: confirmed the exact original crash reproduced cleanly before the fix, and confirmed clean training (no crash, no silent misbehaviour) after it, across several real runs with growing/shifting class counts.
+
+**Verified end-to-end on real, non-simulated multi-class data:** after generating a genuine sustained UDP flood via `tests/attack_simulator.py` (see 2.4) that the LLM correctly classified as `ddos` with high confidence, the classifier successfully trained: `RandomForest (F1=1.000) on 22 labelled samples` (2 `ddos`, 20 `benign`). The F1=1.000 is expected and not yet meaningful as a generalisation metric — it reflects a small, heavily imbalanced dataset that's trivially separable (a sustained ~3,700 pps flood vs. everything else), not genuine model quality. More real attack variety (and more samples per class) is needed before F1 numbers here should be read as representative — worth stating plainly in any portfolio write-up rather than reporting the number without context.
+
+**Data quality note:**
+- The `labelled_flows` table was wiped clean (`DELETE FROM labelled_flows`, backup kept as `.pre-cleanup-backup`) partway through Phase 2 testing.
+- This removed ~1400+ pre-fix rows (mostly `auto`/`unknown`, plus a handful of confidently-wrong `port_scan`/`ddos` labels from before the prompt fix above) that would otherwise have poisoned classifier training data.
+- All classifier F1 numbers going forward should be read as "trained on post-fix data only."
+
+### 2.4 — Attack simulation for self-generated labels (`tests/attack_simulator.py`) ✅ COMPLETE (real flood traffic generated and successfully labelled end-to-end)
+
+- [x] Write `tests/attack_simulator.py` — generates real, controlled attack traffic:
+  - `--mode flood` — a real UDP flood (single socket, sustained `sendto()` calls, no pipe-buffering distortion) against either `--target localhost` or `--target lan`
+  - `--mode normal` — delegates to the existing `warmup_traffic.sh` for benign traffic variety
+- [x] **Safety enforced in code, not just documented:** `_validate_target()` refuses to send anything outside `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, or `192.168.0.0/16` — a hard check before any traffic is sent, not just a comment.
+
+**Real, repeated finding — same-host traffic hairpins regardless of which "safe" address is used:**
+- The original assumption was that only literal `127.0.0.1` hairpins (per Phase 1's finding). Testing found this is broader: sending flood traffic from Azazel to Azazel's own real LAN IP (`192.168.10.67`) *also* hairpins at the kernel level and never reaches Scapy's capture layer — the kernel recognises "this destination belongs to me" regardless of which of the host's own addresses is used.
+- Multiple attempts to work around this from the host itself failed for different reasons before the real fix was found:
+  - A pure Python `socket.sendto()` loop from the host → hairpinned (same-host destination).
+  - `nc -u` piped through a shell loop from inside the `sentinel-attacker` Docker container → traffic reached the host correctly, but each loop iteration spawned a new `nc` process with a new ephemeral source port, splitting the flood into hundreds of tiny 2-6-packet flows instead of one sustained one — neither the flood guard nor the DDoS tracker could fire on this shape.
+  - `seq | nc -u` (single process, piped input) from the same container → `nc` buffers piped input into very few, large datagrams rather than one packet per line, defeating packet-*count*-based detection even though the same socket/source port was used throughout.
+- **Actual fix:** a real Python `socket.sendto()` loop, run *inside* the Docker container (a genuinely separate network namespace) rather than on the host, targeting the host's real LAN IP. This produces one sustained flow, one real source port, hundreds of thousands of individual `sendto()` calls at true per-packet granularity — this is what finally produced a flow the flood guard correctly recognised (`ATTACK`, tens of thousands of packets, 3,000+ pkts/sec sustained).
+- `--target localhost` in the script is kept for testing the simulator's own traffic-generation logic in isolation, but is explicitly documented as NOT producing capturable/labellable data — `--target lan`, run from a genuinely separate network namespace (e.g. a Docker container), is the only path that actually reaches Sentinel's capture layer.
+
+**Known limitation — port scan simulation deliberately NOT included:**
+- As documented in 2.1's port-scan gap: no detector currently sees a port scan at all, so simulating one today would produce real traffic but zero labelled samples (confirmed directly via a real `nmap -sT` scan). A `--mode port_scan` option is worth adding once `PortScanTracker` (Phase 6 backlog) exists.
+
+**End-to-end result:** the real flood generated this way was correctly flagged `ATTACK` by the flood guard, correctly classified `ddos` with `high` confidence and sound reasoning by the LLM (after the 2.2 prompt fix), correctly stored as a genuine second training class, and successfully used to train the classifier (see 2.3). This is the first time the full Phase 2 pipeline — detection → LLM labelling → classifier training — was proven working end-to-end on real, non-benign, non-corrected-false-positive data.
 
 ### 2.5 — Phase 2 wrap-up
 
@@ -440,10 +495,20 @@ While verifying detection against a real, captured ICMP flood (2000 pings via `p
 
 > Add ideas here as they come to you during development. Move them into a phase above when you decide to implement them.
 
+- [ ] **Port scan tracker (`detection/port_scan_tracker.py`) — high priority, scoped after real testing:**
+  - A per-source, sliding-window tracker of *distinct destination ports* touched — architecturally a sibling to `GlobalRateTracker` in `detection/ddos_tracker.py` (same sliding-window pattern, different key: source IP → set of destination ports, instead of aggregate flow count → distinct source IPs).
+  - Currently **no existing detector catches a port scan**: per-flow Isolation Forest sees only unremarkable individual flows, and `GlobalRateTracker` tracks distinct *sources* (for DDoS), not distinct *destination ports from one source* (a scan's actual signature).
+  - Confirmed via a real `nmap -sT` scan against Sentinel that produced zero SUSPICIOUS/ATTACK verdicts and zero labelled samples despite being genuinely malicious traffic.
+  - Should follow the same deterministic-evidence pattern as the flood guard and DDoS tracker: store directly via a new `Labeller.process_port_scan()`, no LLM confirmation needed once the threshold is crossed.
+- [ ] **Attack simulator: add `--mode port_scan`** once `PortScanTracker` above exists — `tests/attack_simulator.py` deliberately left this out for now since it would produce unlabelled traffic (see Phase 2.4).
+- [ ] **Live display doesn't reflect LLM-corrected verdicts:** a flow's on-screen ATTACK/SUSPICIOUS verdict is rendered before the LLM's analysis completes, so a later SUSPICIOUS→ATTACK promotion (or ATTACK→benign correction) is only visible in the stored database, not retroactively in the terminal table. Re-rendering or annotating the row after the fact is a reasonable Phase 3-ish polish item.
 - [ ] **Environment notes (for future reference / README "Troubleshooting" section):**
   - Arch + Python 3.14: `pandas`/`numpy` must come from `pacman` (`python-pandas`, `python-numpy`), not `pip` — pip tries to build from source against the newest GCC and fails on Cython's `[[maybe_unused]]` attribute placement. Everything else in `requirements.txt` uses loose `>=` version pins specifically to avoid this same class of failure.
   - Packet capture needs raw socket access. Instead of running everything via `sudo` (which causes a separate root vs. user `pip` package path mismatch), grant the capability directly to the Python binary once: `sudo setcap cap_net_raw,cap_net_admin=eip $(readlink -f $(which python))`. After that, run Sentinel as a normal user, no `sudo` needed.
   - `pip install --break-system-packages` is required and expected on Arch when installing without a venv.
+  - Docker Alpine containers: use the `dl-4.alpinelinux.org` mirror explicitly in `/etc/apk/repositories` — the default mirror routing is unreliable from some ISPs (confirmed on Manav's connection), causing `apk update`/`apk add` to hang or fail.
+  - **Same-host traffic hairpins regardless of address used** — not just `127.0.0.1`. Sending traffic from a machine to its OWN real LAN IP also gets short-circuited by the kernel before reaching Scapy's capture layer. Any attack simulation must originate from a genuinely separate network namespace (a Docker container is sufficient) to be captured at all.
+  - When generating high-packet-rate test traffic, use a single persistent socket with real per-packet `sendto()`/`send()` calls in a loop — piping input through `nc` (`seq | nc -u`) buffers into a small number of large datagrams, and spawning a new process per packet (`for i in ...; do nc ...; done`) creates a new ephemeral source port each time, splitting one intended flood into hundreds of tiny separate flows. Neither produces traffic that per-flow or aggregate detectors can correctly recognise.
 - [ ] **Decoy / honeypot port:** open a port that no real service listens on — any connection to it is automatically flagged as a scan
 - [ ] **P2P threat sharing:** share blocked IP lists with other instances of the system (useful if you deploy it on multiple machines)
 - [ ] **Browser extension:** show a warning badge when you visit an IP that your system has previously flagged

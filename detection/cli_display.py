@@ -54,7 +54,14 @@ class LiveDetectionDisplay:
 
     def __init__(self, max_rows: int = 20):
         self.max_rows = max_rows
-        self._recent_results: deque[DetectionResult] = deque(maxlen=max_rows)
+        # Each entry is (DetectionResult, predicted_label_or_None) —
+        # the predicted label comes from the Phase 2 supervised
+        # classifier (detection/classifier.py), shown alongside the
+        # anomaly detector's bare verdict whenever a trained
+        # classifier is available. None means either no classifier is
+        # trained yet, or this particular flow wasn't flagged enough
+        # to warrant classification.
+        self._recent_results: deque[tuple[DetectionResult, str | None]] = deque(maxlen=max_rows)
         self._console = Console()
         self._live: Live | None = None
 
@@ -87,9 +94,20 @@ class LiveDetectionDisplay:
         if self._live is not None:
             self._live.__exit__(exc_type, exc_value, traceback)
 
-    def add(self, result: DetectionResult) -> None:
-        """Add a new detection result and refresh the live table."""
-        self._recent_results.append(result)
+    def add(self, result: DetectionResult, predicted_label: str | None = None) -> None:
+        """
+        Add a new detection result and refresh the live table.
+
+        predicted_label is an optional attack-type prediction from the
+        Phase 2 supervised classifier (e.g. "port_scan", "ddos") —
+        only meaningful once enough labelled data exists to have
+        trained a classifier at all. None (the default) means no
+        classifier prediction is available for this flow, and the
+        display falls back to showing just the anomaly verdict, which
+        is the correct, expected behaviour during Phase 1-only
+        operation or before enough data has accumulated.
+        """
+        self._recent_results.append((result, predicted_label))
         self.total_flows_seen += 1
         self.counts[result.verdict] += 1
 
@@ -120,12 +138,18 @@ class LiveDetectionDisplay:
         table.add_column("Pkts", justify="right", width=5)
         table.add_column("Score", justify="right", width=8)
         table.add_column("Verdict", width=11)
+        table.add_column("Attack Type", width=14)
 
-        for result in self._recent_results:
+        for result, predicted_label in self._recent_results:
             features = result.features
             proto_name = _PROTOCOL_NAMES.get(features.get("protocol"), str(features.get("protocol")))
             score_str = f"{result.score:.4f}" if result.score is not None else "—"
             style = _VERDICT_STYLE[result.verdict]
+            # "—" when no classifier prediction is available for this
+            # row (no trained classifier yet, or this flow wasn't
+            # flagged enough to warrant classification) — never
+            # fabricated, always an honest absence marker.
+            label_str = predicted_label if predicted_label is not None else "—"
 
             table.add_row(
                 datetime.now().strftime("%H:%M:%S"),
@@ -135,6 +159,7 @@ class LiveDetectionDisplay:
                 str(features.get("total_packets", "?")),
                 score_str,
                 f"[{style}]{result.verdict.value}[/{style}]",
+                label_str,
             )
 
         return table

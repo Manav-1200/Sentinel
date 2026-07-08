@@ -45,7 +45,7 @@ detection:
   # Number of flows to collect silently on startup before
   # flagging anomalies. Gives the model a baseline of normal
   # traffic before it starts alerting.
-  warmup_flows: 500
+  warmup_flows: 30
 
   # Isolation Forest contamination parameter (0.0 – 0.5).
   # Rough estimate of the fraction of traffic that is malicious.
@@ -91,7 +91,7 @@ detection:
   # Minimum number of labelled samples required before the
   # supervised classifier (XGBoost) is enabled.
   # Below this count, only the anomaly detector runs.
-  min_classifier_samples: 1000
+  min_classifier_samples: 10
 
   # Number of suspicion events from the same IP within this
   # time window (seconds) before escalating to a block.
@@ -204,6 +204,50 @@ storage:
 
   # Training history log.
   training_log: "data/logs/training_history.log"
+
+# ------------------------------------------------------------
+# LLM-assisted flow analysis (Phase 2)
+# ------------------------------------------------------------
+# Used to reason about SUSPICIOUS/ATTACK flows and assign a specific
+# attack-type label, which becomes training data for the supervised
+# classifier (Phase 2). Only called for flows that the anomaly
+# detector already flagged — never for NORMAL flows — to keep usage
+# (and cost, for paid providers) low.
+llm:
+  # "nim" (NVIDIA NIM, free tier, OpenAI-compatible API — default) or
+  # "anthropic" (Claude API, requires prepaid credit, no free tier).
+  # Swapping providers only requires changing this value and setting
+  # the matching API key in .env — see detection/llm_analyser.py.
+  provider: "nim"
+
+  # NVIDIA NIM settings (only used when provider: "nim")
+  nim:
+    base_url: "https://integrate.api.nvidia.com/v1"
+    model: "meta/llama-3.1-8b-instruct"
+
+  # Anthropic settings (only used when provider: "anthropic")
+  anthropic:
+    model: "claude-sonnet-4-6"
+
+  # Shared settings, used regardless of provider:
+
+  # Only flows with an anomaly score below this (more negative =
+  # more anomalous) get sent to the LLM at all. This is a SEPARATE,
+  # stricter threshold than detection.thresholds.suspicious — calling
+  # an LLM on every mildly-unusual flow would be wasteful even on a
+  # free tier (rate limits still apply), so only the more confidently
+  # unusual flows get the extra LLM reasoning step.
+  min_score_for_analysis: -0.03
+
+  # Maximum LLM calls allowed per minute — protects against burning
+  # through free-tier rate limits during a real attack (when many
+  # flows might be flagged in a short window) or during testing.
+  max_calls_per_minute: 20
+
+  # Request timeout in seconds — if the LLM provider doesn't respond
+  # in time, Sentinel falls back to the anomaly detector's own verdict
+  # rather than blocking the whole pipeline waiting on a slow request.
+  timeout_seconds: 10
 
 # ------------------------------------------------------------
 # Model storage
