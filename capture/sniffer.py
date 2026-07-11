@@ -202,7 +202,7 @@ class FlowAssembler:
     and when it's "finished" lives here, once.
     """
 
-    def __init__(self, flow_timeout: float, max_active_flows: int, on_new_flow=None):
+    def __init__(self, flow_timeout: float, max_active_flows: int, on_new_flow=None, on_new_flow_with_port=None):
         self.flow_timeout = flow_timeout
         self.max_active_flows = max_active_flows
 
@@ -214,6 +214,16 @@ class FlowAssembler:
         # that tracking does. None is a valid value (no-op) — most
         # tests and simple uses don't need this hook at all.
         self.on_new_flow = on_new_flow
+
+        # Optional callback invoked with (src_ip, dst_ip, dst_port,
+        # timestamp) every time a brand new flow is created (same
+        # cadence as on_new_flow above — once per flow, not per
+        # packet). This is how PortScanTracker (see
+        # detection/port_scan_tracker.py) observes flow creation
+        # events — it needs the destination port as well as the
+        # source IP, unlike GlobalRateTracker, which is deliberately
+        # port-agnostic. None is a valid value (no-op).
+        self.on_new_flow_with_port = on_new_flow_with_port
 
         # Active flows currently being assembled, keyed by FlowKey.
         self._active_flows: dict[FlowKey, Flow] = {}
@@ -297,6 +307,14 @@ class FlowAssembler:
                     # packet — that distinction matters for accurate
                     # rate tracking.
                     self.on_new_flow(src_ip, timestamp)
+
+                if self.on_new_flow_with_port is not None:
+                    # Same cadence as on_new_flow above (once per new
+                    # flow, not per packet) — but also passes
+                    # dst_ip/dst_port, which PortScanTracker needs in
+                    # order to count distinct destination ports per
+                    # source IP.
+                    self.on_new_flow_with_port(src_ip, dst_ip, dst_port, timestamp)
             else:
                 # Determine direction relative to how the flow started.
                 direction = "forward" if (src_ip == flow.src_ip and src_port == flow.src_port) else "backward"
@@ -379,11 +397,12 @@ class PacketSniffer(FlowAssembler):
     the packet queue used to keep up with high packet rates.
     """
 
-    def __init__(self, config: dict, on_new_flow=None):
+    def __init__(self, config: dict, on_new_flow=None, on_new_flow_with_port=None):
         super().__init__(
             flow_timeout=float(config["capture"]["flow_timeout_seconds"]),
             max_active_flows=int(config["capture"]["max_active_flows"]),
             on_new_flow=on_new_flow,
+            on_new_flow_with_port=on_new_flow_with_port,
         )
         self.interfaces: list[str] = resolve_interfaces(config["capture"]["interfaces"])
 

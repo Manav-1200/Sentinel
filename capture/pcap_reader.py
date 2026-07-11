@@ -43,10 +43,12 @@ class PcapReader(FlowAssembler):
     making it ideal for reproducible tests.
     """
 
-    def __init__(self, config: dict, pcap_path: str):
+    def __init__(self, config: dict, pcap_path: str, on_new_flow=None, on_new_flow_with_port=None):
         super().__init__(
             flow_timeout=float(config["capture"]["flow_timeout_seconds"]),
             max_active_flows=int(config["capture"]["max_active_flows"]),
+            on_new_flow=on_new_flow,
+            on_new_flow_with_port=on_new_flow_with_port,
         )
         self.pcap_path = pcap_path
 
@@ -101,5 +103,3 @@ class PcapReader(FlowAssembler):
 
         for flow in remaining:
             yield flow
-
-            

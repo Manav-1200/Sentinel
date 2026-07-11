@@ -71,9 +71,47 @@ class TestLabellingWithoutLLM:
         assert stored.label == "unknown"
         assert stored.label_source == "auto"
 
-    def test_should_analyse_false_skips_llm_entirely(self, db_config):
+    def test_should_analyse_false_skips_llm_for_suspicious(self, db_config):
+        """
+        should_analyse() only gates LLM calls for SUSPICIOUS verdicts.
+        ATTACK verdicts (e.g. the flood-rate guard) always get sent
+        to the LLM regardless of should_analyse() — see
+        Labeller.process()'s docstring: "Anomaly score below
+        llm.min_score_for_analysis, OR the detector already said
+        ATTACK (flood-guard) -> ask the LLM." This test previously
+        used Verdict.ATTACK, which meant it was actually exercising
+        the "always analyse on ATTACK" branch and asserting the
+        opposite of what really happens — it passed for the wrong
+        reason until the OR-based gating was correctly implemented.
+        Using SUSPICIOUS here is what actually exercises
+        should_analyse() as a real gate.
+        """
         good_analysis = AnalysisResult(
             available=True, attack_type="port_scan",
+            confidence=AnalysisConfidence.HIGH, reasoning="test",
+        )
+        fake = FakeAnalyser(good_analysis, should_analyse_value=False)
+        labeller = Labeller(db_config, llm_analyser=fake)
+
+        result = DetectionResult(Verdict.SUSPICIOUS, -0.01, ATTACK_FEATURES)
+        stored = labeller.process(result)
+
+        assert fake.analyse_call_count == 0  # LLM correctly skipped for SUSPICIOUS + should_analyse=False
+        assert stored.label == "unknown"
+        assert stored.label_source == "auto"
+
+    def test_attack_verdict_always_analysed_even_if_should_analyse_false(self, db_config):
+        """
+        Complementary case to the test above: an ATTACK verdict
+        (e.g. flood-rate guard) must ALWAYS be sent to the LLM,
+        regardless of what should_analyse() says — this is the OR
+        branch in Labeller.process(). Flood-guard-triggered ATTACKs
+        are rarer and deterministic-rule-based, so they're always
+        worth a real LLM judgment rather than being silently
+        auto-labelled "unknown".
+        """
+        good_analysis = AnalysisResult(
+            available=True, attack_type="syn_flood",
             confidence=AnalysisConfidence.HIGH, reasoning="test",
         )
         fake = FakeAnalyser(good_analysis, should_analyse_value=False)
@@ -82,9 +120,9 @@ class TestLabellingWithoutLLM:
         result = DetectionResult(Verdict.ATTACK, -0.01, ATTACK_FEATURES)
         stored = labeller.process(result)
 
-        assert fake.analyse_call_count == 0  # LLM was never actually called
-        assert stored.label == "unknown"
-        assert stored.label_source == "auto"
+        assert fake.analyse_call_count == 1  # LLM WAS called despite should_analyse=False
+        assert stored.label == "syn_flood"
+        assert stored.label_source == "llm"
 
 
 class TestLabellingWithLLM:

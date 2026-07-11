@@ -37,6 +37,37 @@ to degrade gracefully — if the LLM call fails for any reason, the
 caller gets a clearly-marked "analysis unavailable" result rather than
 an exception that could crash the whole detection pipeline. A flaky
 LLM provider must never be able to take down live packet capture.
+
+Hard timeout backstop (added July 2026, after a real hang):
+--------------------------------------------------------------
+Passing `timeout=...` to the OpenAI/Anthropic client constructor sets
+an HTTP-level timeout, but BOTH SDKs also retry failed/timed-out
+requests by default (typically max_retries=2, with backoff between
+attempts) — so a single configured timeout of, say, 10 seconds can
+silently become 30-40+ seconds in practice once retries are counted,
+and in rare cases (a hung TCP connection that never cleanly times out
+at the socket level, a proxy holding a connection open) could block
+far longer than that. Since `analyse()` is called synchronously from
+the main capture loop for every SUSPICIOUS/ATTACK flow, any hang here
+blocks live packet capture entirely — exactly the failure mode this
+module's docstring says must never happen.
+
+Two independent fixes are applied:
+  1. Both clients are constructed with max_retries=0, so the SDK's
+     own retry/backoff behaviour can never multiply the configured
+     timeout.
+  2. The actual network call is additionally run in a worker thread
+     with a hard `future.result(timeout=...)` from the main thread.
+     This is a backstop that does not trust the SDK's own timeout
+     handling at all — even if a future SDK version changes its
+     retry defaults, or a connection hangs in a way neither timeout
+     nor max_retries catches, the calling thread can never block
+     longer than timeout_seconds + a small buffer. The worker thread
+     itself may still be blocked on the underlying socket after this
+     returns (Python cannot forcibly kill a thread) — but it's a
+     daemon thread doing no shared-state mutation, so it is safe to
+     simply abandon and let it die naturally when the network call
+     eventually resolves or the process exits.
 """
 
 from __future__ import annotations
@@ -45,6 +76,7 @@ import json
 import os
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -294,6 +326,14 @@ def _call_nim(prompt: str, config: dict, timeout_seconds: float) -> str:
     Call NVIDIA NIM's OpenAI-compatible API. Raises on any failure —
     callers are responsible for catching and converting to a graceful
     AnalysisResult(available=False, ...).
+
+    max_retries=0: the OpenAI SDK retries failed/timed-out requests
+    twice by default, which would silently turn one configured
+    timeout into up to 3x that duration. Retries are disabled here
+    because analyse() already treats any failure as "unavailable" and
+    the calling pipeline moves on immediately — a fast, clean failure
+    is far more valuable than a slow, hidden one for a live detection
+    loop. See module docstring's "Hard timeout backstop" section.
     """
     from openai import OpenAI
 
@@ -302,7 +342,12 @@ def _call_nim(prompt: str, config: dict, timeout_seconds: float) -> str:
         raise RuntimeError("NVIDIA_NIM_API_KEY is not set in the environment (.env)")
 
     nim_config = config["llm"]["nim"]
-    client = OpenAI(base_url=nim_config["base_url"], api_key=api_key, timeout=timeout_seconds)
+    client = OpenAI(
+        base_url=nim_config["base_url"],
+        api_key=api_key,
+        timeout=timeout_seconds,
+        max_retries=0,
+    )
 
     response = client.chat.completions.create(
         model=nim_config["model"],
@@ -318,6 +363,11 @@ def _call_anthropic(prompt: str, config: dict, timeout_seconds: float) -> str:
     Call the Anthropic Claude API. Raises on any failure — callers
     are responsible for catching and converting to a graceful
     AnalysisResult(available=False, ...).
+
+    max_retries=0: same reasoning as _call_nim above — the Anthropic
+    SDK also retries by default, which would multiply the configured
+    timeout unpredictably. See module docstring's "Hard timeout
+    backstop" section.
     """
     import anthropic
 
@@ -326,7 +376,11 @@ def _call_anthropic(prompt: str, config: dict, timeout_seconds: float) -> str:
         raise RuntimeError("ANTHROPIC_API_KEY is not set in the environment (.env)")
 
     anthropic_config = config["llm"]["anthropic"]
-    client = anthropic.Anthropic(api_key=api_key, timeout=timeout_seconds)
+    client = anthropic.Anthropic(
+        api_key=api_key,
+        timeout=timeout_seconds,
+        max_retries=0,
+    )
 
     response = client.messages.create(
         model=anthropic_config["model"],
@@ -335,6 +389,57 @@ def _call_anthropic(prompt: str, config: dict, timeout_seconds: float) -> str:
         messages=[{"role": "user", "content": prompt}],
     )
     return response.content[0].text
+
+
+# Single shared worker pool for the hard-timeout backstop below. One
+# worker is enough: analyse() is already called synchronously, one
+# flow at a time, from the main capture loop — this thread exists
+# purely so the MAIN thread can enforce a real deadline on a call
+# whose own internal timeout might not fire, not to add concurrency.
+# A module-level pool (rather than one per LLMAnalyser instance) keeps
+# this cheap even if multiple LLMAnalyser instances are constructed
+# in the same process (e.g. try_train_classifier's Labeller vs. the
+# live one in main.py).
+_llm_call_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm-analyser-call")
+
+
+def _run_with_hard_timeout(func, timeout_seconds: float, *args, **kwargs):
+    """
+    Run `func(*args, **kwargs)` in a worker thread and enforce a hard
+    wall-clock deadline from the CALLING thread, regardless of
+    whether func's own internal timeout/retry logic actually fires.
+
+    This is the backstop described in the module docstring: even if
+    the OpenAI/Anthropic client's own `timeout=` argument fails to
+    cut off a hung connection (a stalled proxy, a DNS resolution that
+    never completes, a future SDK version with different retry
+    defaults), the calling thread is GUARANTEED to regain control
+    after timeout_seconds + a small buffer.
+
+    If the deadline is exceeded, the worker thread is simply abandoned
+    (Python has no safe way to forcibly kill a thread) — this is fine
+    here because the worker does no shared mutable state, only a
+    single outbound network call and a return value that will simply
+    be discarded if it arrives late.
+
+    Raises TimeoutError (a plain builtin, not concurrent.futures'
+    subclass) on deadline exceeded, or re-raises whatever exception
+    func itself raised.
+    """
+    future = _llm_call_executor.submit(func, *args, **kwargs)
+    try:
+        # +2s buffer: the client's own timeout is enforced internally
+        # by the SDK's HTTP layer; this outer deadline just needs to
+        # be slightly more generous so a clean internal timeout has a
+        # chance to return normally, while still guaranteeing this
+        # call can never block indefinitely.
+        return future.result(timeout=timeout_seconds + 2.0)
+    except FutureTimeoutError:
+        raise TimeoutError(
+            f"LLM call did not return within {timeout_seconds + 2.0:.1f}s "
+            "(hard backstop timeout — the SDK's own timeout/retry handling "
+            "did not return control in time)."
+        )
 
 
 # ----------------------------------------------------------------------
@@ -374,7 +479,9 @@ class LLMAnalyser:
         Returns AnalysisResult(available=False, ...) gracefully for
         ANY failure — rate limit exceeded, network error, timeout,
         malformed response — rather than raising. This method must
-        never crash the calling pipeline.
+        never crash the calling pipeline, and — as of the hard
+        timeout backstop described in the module docstring — must
+        never block it for longer than timeout_seconds + 2s either.
         """
         if not self._rate_limiter.allow_call():
             return AnalysisResult(
@@ -386,13 +493,18 @@ class LLMAnalyser:
 
         try:
             if self.provider == "nim":
-                raw_response = _call_nim(prompt, self._config, self.timeout_seconds)
+                raw_response = _run_with_hard_timeout(
+                    _call_nim, self.timeout_seconds, prompt, self._config, self.timeout_seconds
+                )
             else:
-                raw_response = _call_anthropic(prompt, self._config, self.timeout_seconds)
+                raw_response = _run_with_hard_timeout(
+                    _call_anthropic, self.timeout_seconds, prompt, self._config, self.timeout_seconds
+                )
         except Exception as e:
             # Deliberately broad: ANY failure here (network error,
-            # auth error, timeout, provider outage, missing API key)
-            # must degrade gracefully, not crash flow processing.
+            # auth error, timeout, provider outage, missing API key,
+            # or the hard backstop TimeoutError above) must degrade
+            # gracefully, not crash flow processing.
             return AnalysisResult(available=False, error=f"{type(e).__name__}: {e}")
 
         return _parse_llm_response(raw_response)
