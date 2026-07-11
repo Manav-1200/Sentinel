@@ -82,6 +82,20 @@ Aggregate DDoS samples (process_ddos_attack):
   only per-flow DetectionResults) since a DDoS finding has no single
   underlying flow — see main.py for where this is invoked, on the
   transition into an ATTACK-level DDoS verdict.
+
+Per-source port-scan samples (process_port_scan_attack):
+-------------------------------------------
+  detection/port_scan_tracker.py's PortScanTracker watches for a
+  different pattern no single flow can reveal on its own: one source
+  touching many distinct destination ports. Like the DDoS tracker's
+  finding, a reported ATTACK verdict here is already deterministic,
+  rule-based evidence (the source's distinct-port count crossed
+  attack_distinct_ports_threshold) — so, exactly like
+  process_ddos_attack, no LLM confirmation is requested. Called
+  separately from process() since a port-scan finding is aggregated
+  per source IP across many flows, not tied to any single flow — see
+  main.py for where this is invoked, on the transition into an
+  ATTACK-level port-scan verdict for a given source IP.
 """
 
 from __future__ import annotations
@@ -128,7 +142,7 @@ class LabelledSample:
     id: int
     timestamp: str
     label: str
-    label_source: str  # "llm", "llm_failed", "auto", or "ddos_tracker"
+    label_source: str  # "llm", "llm_failed", "auto", "ddos_tracker", or "port_scan_tracker"
     confidence: str
     anomaly_score: Optional[float]
     verdict: str
@@ -140,8 +154,10 @@ class Labeller:
     """
     Wires together anomaly detection results, the LLM analyser, and
     SQLite storage. Call `process(result)` once per flow that the
-    anomaly detector has already scored, and `process_ddos_attack()`
-    on the transition into an aggregate DDoS ATTACK verdict.
+    anomaly detector has already scored, `process_ddos_attack()` on
+    the transition into an aggregate DDoS ATTACK verdict, and
+    `process_port_scan_attack()` on the transition into a per-source
+    port-scan ATTACK verdict.
     """
 
     def __init__(self, config: dict, llm_analyser: Optional[LLMAnalyser] = None):
@@ -165,7 +181,8 @@ class Labeller:
         here).
 
         For aggregate DDoS detections (no single underlying flow),
-        see process_ddos_attack() instead.
+        see process_ddos_attack() instead. For per-source port-scan
+        detections, see process_port_scan_attack() instead.
         """
         if result.verdict not in (Verdict.SUSPICIOUS, Verdict.ATTACK):
             return None
@@ -251,6 +268,58 @@ class Labeller:
             effective_verdict=Verdict.ATTACK,
             label="ddos",
             source="ddos_tracker",
+            confidence="high",
+            reasoning=reasoning,
+        )
+
+    def process_port_scan_attack(self, port_scan_result) -> LabelledSample:
+        """
+        Store a genuine port-scan detection (see
+        detection/port_scan_tracker.py's PortScanTracker) as a
+        labelled training sample.
+
+        Like process_ddos_attack, a port-scan ATTACK verdict is
+        already deterministic, rule-based evidence — the source IP's
+        distinct-destination-port count within the sliding window
+        crossed attack_distinct_ports_threshold (see
+        PortScanTracker.check() for the exact rule). No LLM
+        confirmation is requested here, for the same reason
+        process_ddos_attack skips it: asking the LLM to "confirm" an
+        already-deterministic threshold crossing adds a point of
+        failure without adding real certainty.
+
+        Callers (see main.py) should call this ONCE per transition
+        into an ATTACK-level port-scan verdict for a given source IP,
+        not on every flow processed while the scan is ongoing — this
+        method itself doesn't de-duplicate, since it has no visibility
+        into prior calls (mirrors process_ddos_attack's contract).
+
+        There is no single underlying flow for this aggregate,
+        per-source pattern, so a synthetic feature dict describing the
+        scan (source IP, window size, distinct ports/targets touched)
+        is stored instead of real per-flow features. anomaly_score is
+        None, matching how aggregate DDoS samples are stored — there
+        is no Isolation Forest score for this kind of finding.
+        """
+        features = {
+            "detection_type": "port_scan",
+            "src_ip": port_scan_result.src_ip,
+            "window_seconds": port_scan_result.window_seconds,
+            "distinct_ports_in_window": port_scan_result.distinct_ports_in_window,
+            "distinct_targets_in_window": port_scan_result.distinct_targets_in_window,
+        }
+        synthetic_result = DetectionResult(Verdict.ATTACK, None, features)
+        reasoning = (
+            f"Port scan tracker: source {port_scan_result.src_ip} touched "
+            f"{port_scan_result.distinct_ports_in_window} distinct destination ports "
+            f"across {port_scan_result.distinct_targets_in_window} targets within a "
+            f"{port_scan_result.window_seconds:.0f}s window (threshold exceeded)."
+        )
+        return self._store(
+            synthetic_result,
+            effective_verdict=Verdict.ATTACK,
+            label="port_scan",
+            source="port_scan_tracker",
             confidence="high",
             reasoning=reasoning,
         )
@@ -379,15 +448,17 @@ class Labeller:
         from a real LLM judgment ("llm") vs. never got analysed at
         all ("auto", score didn't meet llm.min_score_for_analysis) vs.
         an LLM call that was attempted but failed ("llm_failed") vs.
-        a deterministic aggregate DDoS detection ("ddos_tracker").
+        a deterministic aggregate DDoS detection ("ddos_tracker") vs.
+        a deterministic port-scan detection ("port_scan_tracker").
 
         This is the key diagnostic for understanding classifier
-        training data quality: "llm" and "ddos_tracker" samples are
-        used for training (see TRAINING_LABEL_SOURCES in
-        detection/classifier.py) — a database dominated by "auto"
-        means very little of the accumulated data is actually usable
-        yet, which directly explains a classifier trained on far
-        fewer real samples than the total row count might suggest.
+        training data quality: "llm", "ddos_tracker", and
+        "port_scan_tracker" samples are used for training (see
+        TRAINING_LABEL_SOURCES in detection/classifier.py) — a
+        database dominated by "auto" means very little of the
+        accumulated data is actually usable yet, which directly
+        explains a classifier trained on far fewer real samples than
+        the total row count might suggest.
         """
         conn = self._connect()
         try:

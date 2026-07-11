@@ -119,13 +119,19 @@ def run_live_capture(config: dict) -> None:
     from detection.cli_display import LiveDetectionDisplay
     from detection.logger import DetectionLogger
     from detection.ddos_tracker import GlobalRateTracker, DDoSVerdict
+    from detection.port_scan_tracker import PortScanTracker, PortScanVerdict
     from detection.llm_analyser import LLMAnalyser
     from pipeline.labeller import Labeller
 
     print_banner(config, mode="live capture")
 
     ddos_tracker = GlobalRateTracker(config)
-    sniffer = PacketSniffer(config, on_new_flow=ddos_tracker.record_new_flow)
+    port_scan_tracker = PortScanTracker(config)
+    sniffer = PacketSniffer(
+        config,
+        on_new_flow=ddos_tracker.record_new_flow,
+        on_new_flow_with_port=port_scan_tracker.record_new_flow,
+    )
     extractor = FeatureExtractor(config)
     detector = AnomalyDetector(config)
     logger = DetectionLogger(config)
@@ -153,6 +159,16 @@ def run_live_capture(config: dict) -> None:
     # single aggregate ATTACK period should produce ONE stored
     # training sample, not one per flow processed while it persists.
     last_ddos_verdict = DDoSVerdict.NORMAL
+
+    # Per-source equivalent for port-scan verdicts. Unlike the DDoS
+    # tracker (one global verdict for the whole pipeline),
+    # PortScanTracker.check() returns a verdict PER SOURCE IP, so a
+    # single scalar isn't enough here — we need to remember the last
+    # verdict seen for each source individually, otherwise an ongoing
+    # scanner would re-trigger process_port_scan_attack() on every
+    # single flow it generates while ATTACK persists, instead of once
+    # on the transition into ATTACK.
+    last_port_scan_verdict_by_source: dict[str, PortScanVerdict] = {}
 
     try:
         with display:
@@ -213,6 +229,23 @@ def run_live_capture(config: dict) -> None:
                     if ddos_result.verdict == DDoSVerdict.ATTACK:
                         labeller.process_ddos_attack(ddos_result)
                     last_ddos_verdict = ddos_result.verdict
+
+                # Per-source port-scan check — same structural reason as
+                # the DDoS check above (a per-flow detector can't see
+                # "one source touching many distinct ports"), but keyed
+                # per source_ip rather than global. See
+                # detection/port_scan_tracker.py for the detection
+                # logic. Checked for the source IP of THIS flow, since
+                # that's the only source we have fresh information for
+                # right now.
+                port_scan_result = port_scan_tracker.check(flow.src_ip, flow.last_seen)
+                previous_verdict = last_port_scan_verdict_by_source.get(
+                    flow.src_ip, PortScanVerdict.NORMAL
+                )
+                if port_scan_result.verdict != previous_verdict:
+                    if port_scan_result.verdict == PortScanVerdict.ATTACK:
+                        labeller.process_port_scan_attack(port_scan_result)
+                    last_port_scan_verdict_by_source[flow.src_ip] = port_scan_result.verdict
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow] Flushing current window.")
         sniffer.stop()
@@ -227,6 +260,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     from detection.cli_display import LiveDetectionDisplay
     from detection.logger import DetectionLogger
     from detection.ddos_tracker import GlobalRateTracker, DDoSVerdict
+    from detection.port_scan_tracker import PortScanTracker, PortScanVerdict
     from detection.llm_analyser import LLMAnalyser
     from pipeline.labeller import Labeller
 
@@ -237,7 +271,13 @@ def run_pcap(config: dict, pcap_path: str) -> None:
         sys.exit(1)
 
     ddos_tracker = GlobalRateTracker(config)
-    reader = PcapReader(config, pcap_path, on_new_flow=ddos_tracker.record_new_flow)
+    port_scan_tracker = PortScanTracker(config)
+    reader = PcapReader(
+        config,
+        pcap_path,
+        on_new_flow=ddos_tracker.record_new_flow,
+        on_new_flow_with_port=port_scan_tracker.record_new_flow,
+    )
     extractor = FeatureExtractor(config)
     detector = AnomalyDetector(config)
     logger = DetectionLogger(config)
@@ -247,6 +287,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     display = LiveDetectionDisplay(max_rows=20)
 
     last_ddos_verdict = DDoSVerdict.NORMAL
+    last_port_scan_verdict_by_source: dict[str, PortScanVerdict] = {}
 
     with display:
         for flow in reader.stream_flows():
@@ -272,6 +313,15 @@ def run_pcap(config: dict, pcap_path: str) -> None:
                 if ddos_result.verdict == DDoSVerdict.ATTACK:
                     labeller.process_ddos_attack(ddos_result)
                 last_ddos_verdict = ddos_result.verdict
+
+            port_scan_result = port_scan_tracker.check(flow.src_ip, flow.last_seen)
+            previous_verdict = last_port_scan_verdict_by_source.get(
+                flow.src_ip, PortScanVerdict.NORMAL
+            )
+            if port_scan_result.verdict != previous_verdict:
+                if port_scan_result.verdict == PortScanVerdict.ATTACK:
+                    labeller.process_port_scan_attack(port_scan_result)
+                last_port_scan_verdict_by_source[flow.src_ip] = port_scan_result.verdict
 
     console.print("[green]Pcap replay complete.[/green]")
 
@@ -302,12 +352,19 @@ def run_label(config: dict) -> None:
         return
 
     total = sum(counts.values())
-    usable = source_counts.get("llm", 0) + source_counts.get("ddos_tracker", 0)
+    usable = source_counts.get("llm", 0)
 
     console.print(f"[cyan]Total stored samples:[/cyan] {total}")
     console.print(
-        f"[cyan]Usable for classifier training (label_source='llm' or 'ddos_tracker'):[/cyan] {usable} "
+        f"[cyan]Usable for classifier training (label_source='llm'):[/cyan] {usable} "
         f"({usable / total * 100:.1f}% of total)\n"
+    )
+    console.print(
+        "[dim]Note: 'ddos_tracker' and 'port_scan_tracker' samples are stored for record-keeping "
+        "and audit purposes, but are NOT used to train the classifier — they carry a small, "
+        "synthetic feature set (window size, distinct port/source counts) that doesn't match "
+        "the ~30 real per-flow features the classifier is trained and queried on. See "
+        "detection/classifier.py's TRAINING_LABEL_SOURCES.[/dim]\n"
     )
 
     console.print("[bold]By label:[/bold]")
@@ -318,13 +375,14 @@ def run_label(config: dict) -> None:
     console.print("[bold]By label source:[/bold]")
     source_descriptions = {
         "llm": "a real LLM judgment — usable for classifier training",
-        "ddos_tracker": "a deterministic aggregate DDoS finding — usable for classifier training",
+        "ddos_tracker": "a deterministic aggregate DDoS finding — stored for audit, NOT used for classifier training",
+        "port_scan_tracker": "a deterministic port-scan finding — stored for audit, NOT used for classifier training",
         "auto": "score didn't meet llm.min_score_for_analysis — never sent to the LLM",
         "llm_failed": "LLM call attempted but failed (timeout/rate limit/error)",
     }
     for source, count in sorted(source_counts.items(), key=lambda x: -x[1]):
         description = source_descriptions.get(source, "")
-        console.print(f"  {source:<12} {count:<8} [dim]{description}[/dim]")
+        console.print(f"  {source:<18} {count:<8} [dim]{description}[/dim]")
 
     if usable < total * 0.1:
         console.print(

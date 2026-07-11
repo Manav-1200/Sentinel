@@ -49,6 +49,30 @@ there isn't enough data for both sides of that requirement, or if any
 class has fewer than MIN_SAMPLES_PER_CLASS examples at all, train()
 raises a clear, specific ValueError rather than attempting an
 unreliable split.
+
+TRAINING_LABEL_SOURCES restricted to "llm" only (fixed July 2026):
+--------------------------------------------------------------------
+This set previously included "ddos_tracker" (and, briefly, was about
+to be expanded to also include "port_scan_tracker"). Both were
+reverted after Phase 2.5 verification surfaced a real, fundamental
+incompatibility: process_ddos_attack() and process_port_scan_attack()
+in pipeline/labeller.py store a small SYNTHETIC feature dict
+describing the aggregate pattern itself (window_seconds,
+distinct_ports_in_window, distinct_sources_in_window, etc.) — nothing
+like the ~30 real per-flow features (syn_ratio, packets_per_second,
+iat_mean, etc.) that every "llm"-sourced sample carries, and that
+predict() is always called with from main.py's live pipeline. Mixing
+these two incompatible schemas in one training set meant _get_feature_
+order() would pick whichever schema happened to belong to the first
+sample returned by fetch_all() (no deterministic ordering), and then
+attempt to index every OTHER sample by that same key list — silently
+producing a classifier trained on a fraction of the intended data (if
+the mismatched samples happened to get excluded upstream) or a hard
+KeyError (if they didn't). "ddos" and "port_scan" labelled samples are
+still stored in the database in full — they remain valuable for
+record-keeping, auditing, and any FUTURE dedicated aggregate-pattern
+model — but they must never be fed to THIS classifier, which is
+trained and queried exclusively on real per-flow features.
 """
 
 from __future__ import annotations
@@ -69,15 +93,20 @@ from xgboost import XGBClassifier
 from detection.anomaly import IDENTITY_FIELDS
 
 
-# Only samples labelled by an actual LLM judgment (or a deterministic
-# aggregate finding — see pipeline/labeller.py's process_ddos_attack)
-# are used for training. "auto" (no LLM call was made — score didn't
-# meet the analysis threshold) and "llm_failed" (the call was
-# attempted but failed) both result in label="unknown" by definition,
-# which carries no real training signal — including them would just
-# teach the classifier that "unknown" is a valid, frequent class,
-# which isn't useful or meaningful.
-TRAINING_LABEL_SOURCES = {"llm", "ddos_tracker"}
+# Only samples labelled by an actual LLM judgment are used for
+# training. This is deliberately narrower than "every deterministic,
+# high-confidence label source" — see the module docstring's
+# "TRAINING_LABEL_SOURCES restricted to 'llm' only" section for the
+# real incompatibility this was reverted to fix. "auto" (no LLM call
+# was made — score didn't meet the analysis threshold) and
+# "llm_failed" (the call was attempted but failed) both result in
+# label="unknown" by definition, which carries no real training
+# signal. "ddos_tracker" and "port_scan_tracker" carry a real,
+# confident, deterministic label — but a synthetic, aggregate-pattern
+# feature schema that is fundamentally incompatible with the real
+# per-flow features every other sample (and every live prediction
+# call) uses.
+TRAINING_LABEL_SOURCES = {"llm"}
 
 # Minimum number of distinct classes required to train at all. A
 # classifier trained on a single class can't learn to discriminate
