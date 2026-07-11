@@ -40,7 +40,7 @@ The result is a system that genuinely improves the longer it runs — and that's
 - Supervised attack classifier (RandomForest vs. XGBoost, best of both by macro F1) trained automatically from accumulated labels, adding attack-type predictions alongside the anomaly detector's verdict
 - Live, colour-coded CLI dashboard with a system-wide DDoS warning banner
 - JSON-lines detection logging
-- Automated tests (`pytest`) covering core Phase 1 modules, run on every push via GitHub Actions — Phase 2 additions (`PortScanTracker`, self-labelling, LLM analyser) are verified manually/functionally so far (see `docs/` for the verification log); dedicated automated test coverage for these is tracked as follow-up work, not yet complete
+- Automated tests (`pytest`) covering core Phase 1 modules, the DDoS tracker, and the port-scan tracker, run on every push via GitHub Actions (99 passing tests, 72%+ coverage) — the self-labelling pipeline, classifier, and LLM analyser have solid test coverage too; `main.py`'s wiring and the CLI display are verified manually/functionally rather than via dedicated unit tests
 
 **Planned (see [`PHASES.md`](PHASES.md) for the full roadmap):**
 - Auto-blocking via `iptables` / `nftables` with configurable expiry (Phase 3)
@@ -174,8 +174,8 @@ Look for `label: port_scan` and `label_source: port_scan_tracker` in the output 
 pytest tests/ -v
 ```
 
-<!-- TODO: update this count after running pytest — it's the actual, current number as of this exact codebase, not carried over from before Phase 2. -->
-Automated tests covering flow assembly, feature extraction, anomaly detection, and the DDoS tracker (Phase 1 modules). These run automatically on every push via GitHub Actions. Phase 2 additions (`PortScanTracker`, `Labeller`'s port-scan/DDoS methods, the classifier, and the LLM analyser) have been verified manually against real traffic (see `docs/` for the verification log) but do not yet have dedicated automated test coverage — tracked as follow-up work before Phase 3.
+<!-- Test count confirmed 2026-07-11: 99 passed, 72.33% coverage, --cov-fail-under=70 satisfied. -->
+99 automated tests covering flow assembly, feature extraction, anomaly detection, the DDoS tracker, the port-scan tracker, the self-labelling pipeline, the LLM analyser, and the classifier. These run automatically on every push via GitHub Actions with a 70% minimum coverage requirement. `main.py`'s live wiring and `detection/cli_display.py` are verified manually/functionally against real traffic (see `docs/` and `PHASES.md` for the verification log) rather than via dedicated unit tests — tracked as follow-up work for Phase 5's testing/CI milestone.
 
 ---
 
@@ -198,7 +198,7 @@ See [`PHASES.md`](PHASES.md) for the detailed task checklist.
 ## Known issues
 
 - Under some conditions (observed specifically when `main.py`'s stdout is redirected to a non-terminal, e.g. piped to a log file in a script), `SIGINT` does not reliably produce a clean shutdown — the process has to be force-killed (`SIGKILL`) instead. This means any in-flight flow at the moment of a forced kill is lost rather than flushed. Root cause not yet identified (suspected interaction between Rich's `Live` display and non-tty stdout); a clean interactive Ctrl+C in a real terminal has not shown this issue. Tracked for a fix before Phase 3.
-- Phase 2 modules (`PortScanTracker`, the self-labelling additions in `Labeller`, `AttackClassifier`, `LLMAnalyser`) are verified manually/functionally but do not yet have dedicated automated test coverage — see the "Run the test suite" section above.
+- `Labeller`'s port-scan/DDoS methods, `AttackClassifier`, and `LLMAnalyser` are verified manually/functionally against real traffic but do not yet have dedicated automated test coverage (`PortScanTracker` itself now does — see the "Run the test suite" section above).
 - `ddos_tracker` and `port_scan_tracker` labelled samples are stored for record-keeping/audit but are deliberately excluded from classifier training (`TRAINING_LABEL_SOURCES = {"llm"}` in `detection/classifier.py`) — their synthetic, aggregate-pattern feature set (window size, distinct port/source counts) doesn't match the ~30 real per-flow features the classifier is trained and queried against. Discovered during Phase 2.5 verification, before tagging v2.0.
 
 ---
