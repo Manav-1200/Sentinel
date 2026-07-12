@@ -103,6 +103,82 @@ def try_train_classifier(config: dict):
     return classifier
 
 
+def build_response_stack(config: dict):
+    """
+    Construct the three Phase 3 response components as a single shared
+    set of instances, so callers (run_live_capture/run_pcap) get one
+    line of setup instead of repeating this wiring twice.
+
+    Returns (geoip, alert_manager, blocker). All three are cheap to
+    construct and safe to build even if their respective features are
+    fully disabled in config.yaml (e.g. every alerting channel off,
+    response.dry_run true) — they simply become no-ops in that case,
+    never errors.
+    """
+    from detection.geoip_lookup import GeoIPLookup
+    from response.alerting import AlertManager
+    from response.blocker import IPBlocker
+
+    geoip = GeoIPLookup(config)
+    alert_manager = AlertManager(config, geoip=geoip)
+    blocker = IPBlocker(config)
+    return geoip, alert_manager, blocker
+
+
+def handle_attack_response(alert_manager, blocker, attack_type: str, src_ip: str,
+                            reasoning: str = None, extra: dict = None) -> None:
+    """
+    Single shared call site for "an ATTACK-level verdict was just
+    confirmed, from whichever detector" — used identically for
+    per-flow ATTACK (flood-guard / LLM-promoted), aggregate DDoS
+    ATTACK, and per-source port-scan ATTACK. Keeping this as one
+    function (rather than inlining alert+block calls at all three
+    transition points) means the alert-then-block ordering and
+    exception isolation only need to be gotten right once.
+
+    Alerting is attempted before blocking (not that the order matters
+    much — both are independently exception-safe — but conceptually
+    "notify" then "act" mirrors how a human analyst would work). A
+    failure in either is caught and logged here so a response-stack
+    problem (bad SMTP creds, missing nft binary) never interrupts the
+    live detection pipeline that called this.
+    """
+    from response.alerting import AlertEvent
+
+    event = AlertEvent(
+        attack_type=attack_type,
+        src_ip=src_ip,
+        verdict="ATTACK",
+        reasoning=reasoning,
+        extra=extra or {},
+    )
+
+    try:
+        alert_manager.send_alert(event)
+    except Exception as e:
+        console.print(f"[yellow]Warning:[/yellow] alerting failed for {src_ip}: {e}")
+
+    try:
+        blocker.block(src_ip, reason=f"{attack_type}: {reasoning or 'no additional detail'}")
+    except Exception as e:
+        console.print(f"[yellow]Warning:[/yellow] blocking failed for {src_ip}: {e}")
+
+
+class _NoOpBlocker:
+    """
+    Passed to handle_attack_response() for the DDoS case, where there
+    is deliberately no single IP to block (see the comment at that
+    call site). Satisfies the same .block() interface as IPBlocker
+    without ever touching the firewall or bookkeeping — a true no-op,
+    kept as a tiny singleton so it never needs constructing per-call.
+    """
+    def block(self, ip: str, reason: str = "") -> None:
+        pass
+
+
+_NoOpBlocker.instance = _NoOpBlocker()
+
+
 def run_live_capture(config: dict) -> None:
     """
     Start the live packet capture pipeline.
@@ -137,6 +213,10 @@ def run_live_capture(config: dict) -> None:
     logger = DetectionLogger(config)
     llm_analyser = LLMAnalyser(config)
     labeller = Labeller(config, llm_analyser=llm_analyser)
+
+    # Phase 3: GeoIP enrichment, alerting, and auto-blocking — one
+    # shared stack for the whole pipeline. See build_response_stack().
+    geoip, alert_manager, blocker = build_response_stack(config)
 
     # Attempt to train the supervised classifier from whatever labelled
     # data already exists. classifier will be None if there isn't
@@ -211,6 +291,23 @@ def run_live_capture(config: dict) -> None:
                 # operator sees on screen.
                 labeller.process(result)
 
+                # Phase 3: a per-flow ATTACK verdict here is always
+                # either the deterministic flood-guard or an
+                # LLM-confirmed promotion from SUSPICIOUS (see
+                # pipeline/labeller.py's promotion logic) — in both
+                # cases it's confirmed evidence, not a raw anomaly
+                # score alone, so it's safe to alert/block on directly.
+                if result.verdict.value == "ATTACK":
+                    src_ip = features.get("src_ip")
+                    if src_ip:
+                        handle_attack_response(
+                            alert_manager, blocker,
+                            attack_type=predicted_label or "anomaly_flood",
+                            src_ip=src_ip,
+                            reasoning=f"Per-flow ATTACK verdict (score={result.score}).",
+                            extra={"dst_ip": features.get("dst_ip"), "dst_port": features.get("dst_port")},
+                        )
+
                 # Aggregate, cross-source DDoS check — runs independently
                 # of the per-flow verdict above. See detection/ddos_tracker.py
                 # for why this needs to be a separate mechanism entirely.
@@ -228,6 +325,29 @@ def run_live_capture(config: dict) -> None:
                     display.set_ddos_status(ddos_result)
                     if ddos_result.verdict == DDoSVerdict.ATTACK:
                         labeller.process_ddos_attack(ddos_result)
+                        # DDoS is many-sources-one-target by definition
+                        # (see ddos_tracker.py) — there is no single
+                        # attacker IP to block. Alert only; blocking
+                        # every distinct source seen in the window
+                        # would be both impractical and likely to
+                        # sweep up innocent hosts. Operators should
+                        # respond to a confirmed DDoS alert with
+                        # upstream/ISP-level mitigation, not a
+                        # per-source Sentinel block.
+                        handle_attack_response(
+                            alert_manager, blocker=_NoOpBlocker.instance,
+                            attack_type="ddos",
+                            src_ip="multiple-sources",
+                            reasoning=(
+                                f"{ddos_result.total_flows_in_window} flows from "
+                                f"{ddos_result.distinct_sources_in_window} distinct sources "
+                                f"in {ddos_result.window_seconds:.0f}s."
+                            ),
+                            extra={
+                                "total_flows_in_window": ddos_result.total_flows_in_window,
+                                "distinct_sources_in_window": ddos_result.distinct_sources_in_window,
+                            },
+                        )
                     last_ddos_verdict = ddos_result.verdict
 
                 # Per-source port-scan check — same structural reason as
@@ -245,10 +365,25 @@ def run_live_capture(config: dict) -> None:
                 if port_scan_result.verdict != previous_verdict:
                     if port_scan_result.verdict == PortScanVerdict.ATTACK:
                         labeller.process_port_scan_attack(port_scan_result)
+                        handle_attack_response(
+                            alert_manager, blocker,
+                            attack_type="port_scan",
+                            src_ip=port_scan_result.src_ip,
+                            reasoning=(
+                                f"Touched {port_scan_result.distinct_ports_in_window} distinct ports "
+                                f"across {port_scan_result.distinct_targets_in_window} targets "
+                                f"in {port_scan_result.window_seconds:.0f}s."
+                            ),
+                            extra={
+                                "distinct_ports_in_window": port_scan_result.distinct_ports_in_window,
+                                "distinct_targets_in_window": port_scan_result.distinct_targets_in_window,
+                            },
+                        )
                     last_port_scan_verdict_by_source[flow.src_ip] = port_scan_result.verdict
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow] Flushing current window.")
         sniffer.stop()
+        blocker.shutdown()
         console.print("[green]Done.[/green] Goodbye.")
 
 
@@ -286,42 +421,91 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     classifier = try_train_classifier(config)
     display = LiveDetectionDisplay(max_rows=20)
 
+    # Phase 3 response stack — same wiring as run_live_capture. Replay
+    # runs through the exact same alert/block logic as live capture,
+    # which is deliberate: it's the fastest way to validate config.yaml
+    # alerting/blocking settings (including against a captured real
+    # attack) without needing a live interface or root/setcap at all.
+    geoip, alert_manager, blocker = build_response_stack(config)
+
     last_ddos_verdict = DDoSVerdict.NORMAL
     last_port_scan_verdict_by_source: dict[str, PortScanVerdict] = {}
 
-    with display:
-        for flow in reader.stream_flows():
-            features = extractor.extract(flow)
-            if features is None:
-                continue
-            result = detector.predict(features)
+    try:
+        with display:
+            for flow in reader.stream_flows():
+                features = extractor.extract(flow)
+                if features is None:
+                    continue
+                result = detector.predict(features)
 
-            predicted_label = None
-            if classifier is not None and result.verdict.value in ("SUSPICIOUS", "ATTACK"):
-                try:
-                    predicted_label, _ = classifier.predict(features)
-                except Exception:
-                    predicted_label = None
+                predicted_label = None
+                if classifier is not None and result.verdict.value in ("SUSPICIOUS", "ATTACK"):
+                    try:
+                        predicted_label, _ = classifier.predict(features)
+                    except Exception:
+                        predicted_label = None
 
-            display.add(result, predicted_label=predicted_label)
-            logger.log(result)
-            labeller.process(result)
+                display.add(result, predicted_label=predicted_label)
+                logger.log(result)
+                labeller.process(result)
 
-            ddos_result = ddos_tracker.check(flow.last_seen)
-            if ddos_result.verdict != last_ddos_verdict:
-                display.set_ddos_status(ddos_result)
-                if ddos_result.verdict == DDoSVerdict.ATTACK:
-                    labeller.process_ddos_attack(ddos_result)
-                last_ddos_verdict = ddos_result.verdict
+                if result.verdict.value == "ATTACK":
+                    src_ip = features.get("src_ip")
+                    if src_ip:
+                        handle_attack_response(
+                            alert_manager, blocker,
+                            attack_type=predicted_label or "anomaly_flood",
+                            src_ip=src_ip,
+                            reasoning=f"Per-flow ATTACK verdict (score={result.score}).",
+                            extra={"dst_ip": features.get("dst_ip"), "dst_port": features.get("dst_port")},
+                        )
 
-            port_scan_result = port_scan_tracker.check(flow.src_ip, flow.last_seen)
-            previous_verdict = last_port_scan_verdict_by_source.get(
-                flow.src_ip, PortScanVerdict.NORMAL
-            )
-            if port_scan_result.verdict != previous_verdict:
-                if port_scan_result.verdict == PortScanVerdict.ATTACK:
-                    labeller.process_port_scan_attack(port_scan_result)
-                last_port_scan_verdict_by_source[flow.src_ip] = port_scan_result.verdict
+                ddos_result = ddos_tracker.check(flow.last_seen)
+                if ddos_result.verdict != last_ddos_verdict:
+                    display.set_ddos_status(ddos_result)
+                    if ddos_result.verdict == DDoSVerdict.ATTACK:
+                        labeller.process_ddos_attack(ddos_result)
+                        handle_attack_response(
+                            alert_manager, blocker=_NoOpBlocker.instance,
+                            attack_type="ddos",
+                            src_ip="multiple-sources",
+                            reasoning=(
+                                f"{ddos_result.total_flows_in_window} flows from "
+                                f"{ddos_result.distinct_sources_in_window} distinct sources "
+                                f"in {ddos_result.window_seconds:.0f}s."
+                            ),
+                            extra={
+                                "total_flows_in_window": ddos_result.total_flows_in_window,
+                                "distinct_sources_in_window": ddos_result.distinct_sources_in_window,
+                            },
+                        )
+                    last_ddos_verdict = ddos_result.verdict
+
+                port_scan_result = port_scan_tracker.check(flow.src_ip, flow.last_seen)
+                previous_verdict = last_port_scan_verdict_by_source.get(
+                    flow.src_ip, PortScanVerdict.NORMAL
+                )
+                if port_scan_result.verdict != previous_verdict:
+                    if port_scan_result.verdict == PortScanVerdict.ATTACK:
+                        labeller.process_port_scan_attack(port_scan_result)
+                        handle_attack_response(
+                            alert_manager, blocker,
+                            attack_type="port_scan",
+                            src_ip=port_scan_result.src_ip,
+                            reasoning=(
+                                f"Touched {port_scan_result.distinct_ports_in_window} distinct ports "
+                                f"across {port_scan_result.distinct_targets_in_window} targets "
+                                f"in {port_scan_result.window_seconds:.0f}s."
+                            ),
+                            extra={
+                                "distinct_ports_in_window": port_scan_result.distinct_ports_in_window,
+                                "distinct_targets_in_window": port_scan_result.distinct_targets_in_window,
+                            },
+                        )
+                    last_port_scan_verdict_by_source[flow.src_ip] = port_scan_result.verdict
+    finally:
+        blocker.shutdown()
 
     console.print("[green]Pcap replay complete.[/green]")
 

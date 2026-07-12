@@ -25,6 +25,30 @@ packets to 500 different ports from the same source IP within two
 seconds is a textbook port scan. That pattern only becomes visible
 when you look at packets *grouped together over time*, which is
 exactly what a flow represents.
+
+SIGINT / shutdown responsiveness (fixed — see _run_capture below):
+----------------------------------------------------------------------
+Earlier versions of this module ran capture via a plain thread calling
+Scapy's blocking `sniff(..., stop_filter=...)`. That function only
+evaluates `stop_filter` AFTER a new packet is captured — internally it
+blocks on the interface socket's `recv()` with no timeout of its own.
+On a quiet interface, that means the capture thread can sit blocked in
+the kernel for an arbitrarily long time after stop() is called,
+because there is no new packet to trigger the stop_filter check at
+all. This was previously misdiagnosed as a "hangs only when stdout
+isn't a tty" issue — in practice, testing interactively over an SSH
+session kept the monitored interface busy enough (the SSH session's
+own traffic) that a packet always arrived within a moment of Ctrl+C,
+masking the real bug; testing with redirected output happened to
+coincide with quieter traffic, making the hang visible. The tty state
+itself was never the actual cause.
+
+The fix: capture now uses Scapy's `AsyncSniffer`, which polls its
+socket with an internal timeout instead of blocking indefinitely on
+`recv()`. Its `.stop()` takes effect within a bounded, short time
+regardless of whether any packets are currently arriving on the
+interface — this is what actually needed to change, not anything
+related to buffering or tty detection.
 """
 
 from __future__ import annotations
@@ -37,7 +61,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
-from scapy.all import sniff, IP, TCP, UDP, ICMP, conf
+from scapy.all import IP, TCP, UDP, ICMP, conf
+from scapy.sendrecv import AsyncSniffer
 from scapy.packet import Packet
 from scapy.interfaces import get_working_ifaces
 
@@ -424,8 +449,17 @@ class PacketSniffer(FlowAssembler):
         self.dropped_packet_count: int = 0
         self._drop_count_lock = threading.Lock()
 
-        # Set by stop() to signal the capture loop to halt.
+        # Set by stop() to signal the flow-assembly loop and worker
+        # thread to halt.
         self._stop_requested = threading.Event()
+
+        # One AsyncSniffer per interface, kept so stop() can call
+        # .stop() on each directly (see _run_capture's docstring for
+        # why AsyncSniffer replaced a manual thread + blocking
+        # sniff() call — this is the fix for the SIGINT/idle-interface
+        # hang). Populated in stream_flows() once capture actually
+        # starts; empty before that.
+        self._async_sniffers: list[AsyncSniffer] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -433,7 +467,7 @@ class PacketSniffer(FlowAssembler):
 
     def stream_flows(self) -> Iterator[Flow]:
         """
-        Start live capture (one background thread per network interface,
+        Start live capture (one AsyncSniffer per network interface,
         plus one dedicated flow-assembly worker thread) and yield
         finished flows as they become available. This is a generator —
         it will keep yielding flows until stop() is called.
@@ -450,17 +484,25 @@ class PacketSniffer(FlowAssembler):
         work. This keeps the capture callback fast enough to keep up
         with bursty traffic (e.g. floods, scans) without the kernel
         socket buffer overflowing and silently dropping packets.
+
+        Each interface is captured via a Scapy AsyncSniffer rather than
+        a thread wrapping the blocking sniff() function — see
+        _run_capture's removal and this class's docstring for why: a
+        plain sniff() call only checks stop_filter after a new packet
+        arrives, so it can block indefinitely on an idle interface even
+        after stop() is called. AsyncSniffer polls its socket with an
+        internal timeout instead, so .stop() takes effect within a
+        bounded, short time regardless of current traffic levels.
         """
-        capture_threads = []
+        self._async_sniffers = []
         for interface in self.interfaces:
-            thread = threading.Thread(
-                target=self._run_capture,
-                args=(interface,),
-                daemon=True,
-                name=f"sentinel-capture-{interface}",
+            sniffer = AsyncSniffer(
+                iface=interface,
+                prn=self._enqueue_packet,
+                store=False,  # Don't let Scapy buffer packets in memory — we handle storage ourselves
             )
-            thread.start()
-            capture_threads.append(thread)
+            sniffer.start()
+            self._async_sniffers.append(sniffer)
 
         worker_thread = threading.Thread(
             target=self._process_queue,
@@ -495,48 +537,28 @@ class PacketSniffer(FlowAssembler):
             yield flow
 
     def stop(self) -> None:
-        """Signal the capture loop to stop and flush remaining flows."""
+        """
+        Signal the capture loop to stop and flush remaining flows.
+
+        Stops every AsyncSniffer directly (bounded, prompt — see class
+        docstring), then sets _stop_requested so the flow-assembly
+        worker thread and the main stream_flows() loop both notice and
+        exit on their next check. A failure stopping any individual
+        AsyncSniffer (e.g. an interface that already went down) is
+        logged and does not prevent stopping the others, or setting
+        _stop_requested — a partial capture-layer shutdown must never
+        block the rest of the pipeline from shutting down cleanly.
+        """
+        for sniffer in self._async_sniffers:
+            try:
+                sniffer.stop()
+            except Exception as e:
+                print(f"[sentinel] Warning: error stopping capture sniffer: {e}")
         self._stop_requested.set()
 
     # ------------------------------------------------------------------
     # Internal: live capture
     # ------------------------------------------------------------------
-
-    def _run_capture(self, interface: str) -> None:
-        """
-        Runs Scapy's sniff() loop on a single interface. This call
-        blocks until stop_filter returns True, so each interface gets
-        its own thread.
-
-        The callback (_enqueue_packet) is intentionally minimal — it
-        does not do flow assembly itself, only a fast push onto a
-        queue drained by a separate worker thread. See stream_flows()
-        for why this matters under high packet rates.
-
-        The socket Scapy opens here will request a larger receive
-        buffer than the OS default, via the module-level `conf.bufsize`
-        setting (applied once, at import time — see SCAPY_BUFSIZE_BYTES
-        above). This works together with the system-wide
-        `net.core.rmem_max` sysctl setting (see docs/performance.md) —
-        both need to be large enough, since the OS caps any per-socket
-        request at that system ceiling.
-
-        Requires root privileges to open a raw socket on most systems.
-        If this interface goes down mid-capture (e.g. WiFi disconnects),
-        we log it and let the thread end gracefully rather than crashing
-        the whole sniffer — other interfaces keep running.
-        """
-        try:
-            sniff(
-                iface=interface,
-                prn=self._enqueue_packet,
-                store=False,  # Don't let Scapy buffer packets in memory — we handle storage ourselves
-                stop_filter=lambda pkt: self._stop_requested.is_set(),
-            )
-        except OSError as e:
-            # Common cause: the interface was unplugged/disabled while
-            # capturing (e.g. WiFi toggled off, USB ethernet unplugged).
-            print(f"[sentinel] Warning: capture on interface '{interface}' stopped: {e}")
 
     def _enqueue_packet(self, packet: Packet) -> None:
         """
