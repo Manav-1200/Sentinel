@@ -144,7 +144,7 @@ response:
 
   # Block private/LAN IP ranges? Almost always false unless
   # you are specifically hunting for insider threats on the LAN.
-  block_private_ranges: false
+  block_private_ranges: true
 
 # ------------------------------------------------------------
 # Alerting settings
