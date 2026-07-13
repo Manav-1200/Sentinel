@@ -129,7 +129,7 @@ ddos:
 response:
   # Master switch. Set to true during development to log what
   # WOULD be blocked without actually running iptables commands.
-  dry_run: true
+  dry_run: false
 
   # How long (in minutes) a blocked IP stays blocked before
   # the rule is automatically removed.
