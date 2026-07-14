@@ -18,7 +18,7 @@
 |-------|------|-----------------|-----------------|--------|
 | 1 | Foundation | Packet capture + feature extraction + anomaly/flood/DDoS detection (CLI) | Project 1 | ✅ Complete — 43 passing tests |
 | 2 | Intelligence | Supervised ML + LLM log analysis + self-labelling pipeline + port-scan detection | Project 1 v2 | ✅ Complete — 99 passing tests, 72%+ coverage (verified end-to-end on real nmap scans, real floods, real DDoS traffic) — tagged `v2.0-supervised-learning` |
-| 3 | Response | Auto-blocking (iptables) + GeoIP + alerting | Project 2 | Not started |
+| 3 | Response | Auto-blocking (nftables/iptables) + GeoIP + alerting | Project 2 | 🟡 Code-complete, not fully verified — core modules built and wired in, real end-to-end block test passed, but alerting/iptables-fallback/DDoS-alert-branch/expiry are still untested against real conditions and there's zero pytest coverage |
 | 4 | Dashboard | Live web dashboard with world map + real-time feed | Project 2 v2 | Not started |
 | 5 | Production | Auto-retraining pipeline + model versioning + hardening | Project 3 | Not started |
 | 6 | Extras | Ideas to add during development (add freely) | — | Ongoing |
@@ -317,71 +317,80 @@ While verifying detection against a real, captured ICMP flood (2000 pings via `p
 
 **Goal:** When an attack is confirmed, do something about it. Auto-block the attacker's IP, look up their location, and send an alert with all the details.
 
-**Important:** All blocking code must include safety checks — never block localhost, the router gateway, or whitelisted IPs. One wrong iptables rule can lock you out of your own machine.
+**Status: 🟡 Code-complete, not fully done.** All three modules are built, wired into `main.py`, and one real end-to-end block has been observed working (nmap scan from a Docker container → nftables rule created → target unreachable). But several real gaps remain open before this phase can be called finished — see the checklist below and the "Known gaps before Phase 3 is done" note at the end.
 
-### 3.1 — IP blocking module (`response/blocker.py`)
+**Important:** All blocking code must include safety checks — never block localhost, the router gateway, or whitelisted IPs. One wrong iptables/nftables rule can lock you out of your own machine.
 
-- [ ] Write `response/blocker.py` — wraps iptables / nftables via Python `subprocess`
-- [ ] Implement `IPBlocker` class with:
-  - `block(ip, reason, duration_minutes=60)` — adds a DROP rule for the IP, logs the action
+### 3.1 — IP blocking module (`response/blocker.py`) ✅ Code-complete — real block verified, expiry and iptables fallback still unverified
+
+- [x] Write `response/blocker.py` — **design change from original plan:** nftables is the preferred backend (a dedicated `inet sentinel` table/set, using native kernel element timeouts for auto-expiry) rather than shelling out to `iptables` directly; `iptables` is kept only as a fallback backend for systems without nftables, with a manual expiry-sweep thread since iptables rules have no native timeout concept
+- [x] Implement `IPBlocker` class with:
+  - `block(ip, reason, duration_minutes=60)` — adds the block (nftables set element with timeout, or iptables DROP rule), logs the action
   - `unblock(ip)` — removes the rule manually
-  - `auto_expire()` — runs every minute via a background thread, removes rules past their duration
-  - `is_blocked(ip)` — checks current iptables rules
+  - auto-expiry — nftables: handled natively by the kernel via element timeouts (no polling thread needed); iptables fallback: manual sweep thread on an interval
+  - `is_blocked(ip)` — checks current nftables set / iptables rules
   - `list_blocked()` — returns all currently blocked IPs with reason and time remaining
-- [ ] Safety checks (raise an exception, never block):
+- [x] Safety checks (raise an exception, never block):
   - `127.0.0.0/8` (loopback)
-  - `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (private ranges) — configurable: can opt in to blocking LAN IPs
+  - `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (private ranges) — configurable via `response.block_private_ranges`; **must be `true`** on any network where the whole LAN is private-range (this was Azazel's case — 192.168.x.x LAN + 172.17.x.x Docker bridge — so leaving this `false` would have made blocking a no-op for all real test traffic)
   - Any IP in `config.yaml` whitelist
-  - Your own public IP (fetched once on startup from `api.ipify.org`)
-- [ ] Dry-run mode (`config.yaml: dry_run: true`) — logs what would be blocked but does not execute `iptables` commands — essential for development and testing
-- [ ] Write all block/unblock actions to `data/logs/blocks.log` (JSON lines)
+  - Your own public IP
+- [x] Dry-run mode (`config.yaml: dry_run: true`) — logs what would be blocked but does not execute nft/iptables commands
+- [x] Write all block/unblock actions to an audit log (JSON lines)
+- [x] **Real end-to-end test passed:** `nmap -sT` from a Docker container against Azazel's LAN IP → detected → nftables rule created in the `inet sentinel` table → subsequent `ping` from the container showed 100% packet loss, confirming the block actually took effect at the kernel level, not just in application logs
+- [ ] **Not yet verified:** a block actually expiring and traffic resuming afterward (the create-side of the flow is proven; the expire-side has not been directly observed completing)
+- [ ] **Not yet verified:** the iptables fallback backend has not been exercised at all — everything tested so far ran with nftables available
+- [ ] **Deployment gotcha, not a task but worth recording here:** `setcap` on the Python binary does **not** propagate to subprocesses — `nft` needs its own, separate `sudo setcap cap_net_admin=eip $(which nft)` or blocking silently fails/needs `sudo`
 
-### 3.2 — GeoIP lookup module (`response/geoip.py`)
+### 3.2 — GeoIP lookup module (`detection/geoip_lookup.py`) ✅ Code-complete
 
-- [ ] Write `response/geoip.py` — resolves an IP address to physical location and network info
-- [ ] Primary method: `ip-api.com` REST API (free, no key, 45 req/min limit)
-  - Returns: country, region, city, ISP, org, latitude, longitude, timezone
-- [ ] Fallback method: MaxMind GeoLite2 offline database (download once, works offline, GDPR-friendly)
-  - Use `geoip2` Python library
-- [ ] Cache results in memory (LRU cache, 1000 entries) — don't re-query the same IP twice in a session
-- [ ] Persist cache to SQLite so it survives restarts
-- [ ] For private/reserved IPs: return `{"country": "Local Network", "city": "—", "lat": null, "lon": null}`
+- [x] Write `detection/geoip_lookup.py` (**note: lives under `detection/`, not `response/`** — deviates from the original plan since it's a lookup/enrichment step consumed by both detection logging and alerting, not a response action itself) — resolves an IP address to physical location and network info
+- [x] Primary method: `ip-api.com` REST API
+- [x] Alternate/fallback method: MaxMind GeoLite2 offline database (`maxmind` backend)
+- [x] Cache results in memory (LRU cache) — don't re-query the same IP twice in a session
+- [x] Private-IP short-circuit — returns immediately for private/reserved ranges without an external lookup
+- [x] Graceful degradation — never raises on lookup failure (rate limit, network error, missing DB); returns a safe empty/unknown result instead so a GeoIP outage can never crash detection or blocking
+- [ ] Persisting the cache to SQLite across restarts was in the original plan but not implemented — currently in-memory only, so the cache is cold on every restart (minor; not currently a functional blocker)
 
-### 3.3 — Alerting module (`response/alerter.py`)
+### 3.3 — Alerting module (`response/alerting.py`) 🟡 Code-complete, untested against real destinations
 
-- [ ] Write `response/alerter.py` — sends notifications when an attack is confirmed and blocked
-- [ ] Support three alert channels (all configurable in `config.yaml`, any can be disabled):
-  - **Email** via SMTP (works with Gmail, Outlook — use app passwords, never hardcode credentials)
+- [x] Write `response/alerting.py` — `AlertManager` sends notifications when an attack is confirmed
+- [x] Support three alert channels, each fully isolated from the others (a failure in one channel — bad SMTP creds, dead webhook, etc. — cannot prevent the others from firing):
+  - **Email** via SMTP
   - **Slack** via incoming webhook URL
-  - **Webhook** — generic HTTP POST to any URL (useful for Discord, custom dashboards, etc.)
-- [ ] Alert payload includes:
-  - Timestamp
-  - Attack type and confidence
-  - Attacker IP address
-  - GeoIP: city, country, ISP, coordinates
-  - Destination port and protocol
-  - Anomaly score and LLM reasoning (one sentence)
-  - Action taken (blocked for X minutes / monitoring only)
-- [ ] Rate limiting: max 1 alert per unique IP per 10 minutes — prevent alert storms if the same IP keeps probing
-- [ ] Test mode: `config.yaml: alert_test: true` — sends a dummy alert on startup to confirm channels work
+  - **Webhook** — generic HTTP POST
+- [x] Alert payload includes GeoIP-enriched details (attacker IP, city/country/ISP/coordinates, destination port/protocol, anomaly score, action taken)
+- [x] Per-source-IP rate limiting — prevents alert storms from a single repeatedly-probing IP
+- [ ] **Not yet done:** none of the three channels have been tested end-to-end against a real destination (real inbox, real Slack workspace, real webhook receiver) — all testing so far has exercised the code paths, not live delivery
+- [ ] **Not yet done:** `.env` alerting credentials (SMTP creds, Slack webhook URL, generic webhook URL) have never actually been configured/populated
+- [ ] Test mode (`config.yaml: alert_test: true`, dummy alert on startup) from the original plan not yet implemented
 
-### 3.4 — Response coordinator (`response/coordinator.py`)
+### 3.4 — Response wiring (no separate `response/coordinator.py`) ✅ Code-complete — one branch never exercised by real traffic
 
-- [ ] Write `response/coordinator.py` — ties blocker + geoip + alerter together with decision logic
-- [ ] Decision rules (all configurable thresholds):
-  - Anomaly score > 0.8 AND classifier agrees → block + alert
-  - Anomaly score 0.6–0.8 → log + alert (no block yet)
-  - Anomaly score < 0.6 → log only
-  - LLM says HIGH confidence attack → always block regardless of score
-- [ ] Repeated offenders: if the same IP triggers 3 suspicion events in 1 hour → escalate to block even if individual scores are below threshold
-- [ ] Write unit tests for each decision rule using mocked blocker/alerter
+- [x] **Design change from original plan:** rather than a standalone `response/coordinator.py` with its own decision-rule engine, response logic is wired directly into `main.py` via `build_response_stack()` (constructs blocker/alerter/geoip once at startup) and `handle_attack_response()`, called at three distinct ATTACK-transition points in the existing detection flow:
+  1. Per-flow ATTACK (flood guard / anomaly detector) → block + alert
+  2. DDoS aggregate ATTACK → alert-only, via a `_NoOpBlocker` (blocking a single IP doesn't make sense for a many-source DDoS; the point is notification, not blocking)
+  3. Per-source port-scan ATTACK → block + alert
+- [x] Real traffic has exercised branches 1 and 3 (the nmap block test above went through this exact path)
+- [ ] **Not yet exercised:** branch 2, the DDoS alert-only path — no real multi-source DDoS traffic has been generated to confirm `_NoOpBlocker` behaves correctly end-to-end (alert fires, no block attempted, no crash)
+- [ ] The original plan's separate configurable score-threshold decision rules (0.8/0.6 bands, repeated-offender escalation) were not built as a distinct rules engine — current logic rides on the existing Verdict (SUSPICIOUS/ATTACK) transitions from Phases 1–2 rather than a new scoring layer. Worth a conscious decision later: keep it this way, or build the richer rules engine originally planned.
+- [ ] Zero unit tests for any of Phase 3 — no mocked-blocker/alerter tests exist yet for any of this wiring
 
-### 3.5 — Phase 3 wrap-up
+### 3.5 — Phase 3 wrap-up — 🟡 In progress
 
-- [ ] Update `README.md` with blocking and alerting setup instructions
-- [ ] Add `docs/safety.md` — explains the IP whitelist, dry-run mode, and how to recover if a rule goes wrong (`iptables -F` to flush all rules)
-- [ ] Tag: `git tag v3.0-active-response`
+- [x] Update `README.md` and `PHASES.md` to reflect Phase 3's real code-complete-but-not-done state (this update)
+- [ ] Close the real gaps below before tagging
+- [ ] Add `docs/safety.md` — explains the IP whitelist, dry-run mode, and recovery (`nft flush ruleset` / `iptables -F`)
+- [ ] Tag: `git tag v3.0-active-response` — **not tagged yet, deliberately**, since real gaps remain
 - [ ] This is the foundation of **Portfolio Project 2**
+
+**Known gaps before Phase 3 can be called done** (tracked here explicitly, not assumed away):
+1. Alerting channels (email/Slack/webhook) untested end-to-end against real destinations
+2. iptables fallback backend never exercised — only nftables has been tested
+3. DDoS alert-only branch (`_NoOpBlocker`) never triggered by real multi-source traffic
+4. nftables block expiry never directly observed completing (creation is proven; expiry isn't)
+5. Zero pytest coverage for any Phase 3 code (`blocker.py`, `alerting.py`, `geoip_lookup.py`, the `main.py` wiring)
+6. `.env` alerting credentials never configured
 
 ---
 
@@ -525,6 +534,8 @@ While verifying detection against a real, captured ICMP flood (2000 pings via `p
 - [ ] **Fix `main.py`'s unreliable clean shutdown when stdout is redirected to a non-terminal:** found during Phase 2.1b's port-scan sample-generation testing. `SIGINT` reliably produces a clean `"Shutting down..."` exit in a real, interactive foreground terminal, but has repeatedly failed to do so when `main.py`'s output is piped to a log file in a script (backgrounded process). Root cause not yet identified — leading suspicion is an interaction between Rich's `Live` display and non-tty stdout, but this hasn't been confirmed. Currently worked around at the script level (bounded grace period + `SIGKILL` escalation in `generate_port_scan_samples.sh`), not fixed at the source. A forced `SIGKILL` means any flow mid-processing at that moment is lost rather than flushed — worth fixing properly before Phase 3 adds auto-blocking, where losing state mid-shutdown has higher stakes.
 - [ ] **Live display doesn't reflect LLM-corrected verdicts:** a flow's on-screen ATTACK/SUSPICIOUS verdict is rendered before the LLM's analysis completes, so a later SUSPICIOUS→ATTACK promotion (or ATTACK→benign correction) is only visible in the stored database, not retroactively in the terminal table. Re-rendering or annotating the row after the fact is a reasonable Phase 3-ish polish item.
 - [x] ~~**Dedicated automated test coverage for `PortScanTracker`**~~ — DONE: `tests/test_port_scan_tracker.py` added (15 tests: threshold crossing at both boundaries, per-source isolation, distinct-ports-vs-distinct-targets, sliding-window eviction on both the record and check paths, unknown-source handling, config defaults/fallback). Coverage went from 0% to 98% for this module, and total project coverage crossed back over the CI's 70% gate (72.33%) as a direct result — this was the actual, confirmed cause of a real CI failure (`Coverage failure: total of 68 is less than fail-under=70`), not a hypothetical gap.
+- [ ] **Phase 3 has zero pytest coverage:** `response/blocker.py`, `response/alerting.py`, `detection/geoip_lookup.py`, and the `handle_attack_response()`/`build_response_stack()` wiring in `main.py` are all code-complete and partially real-traffic-verified (see Phase 3.1/3.4) but have no dedicated unit tests yet — mocked-subprocess tests for the blocker and mocked-channel tests for the alerter are the obvious starting point.
+- [ ] **Manav has additional ideas for Phase 3 to discuss and fold in before it's tagged done** — not yet captured here; revisit and add specifics once discussed.
 - [ ] **Dedicated automated test coverage still missing for `Labeller.process_port_scan_attack()`/`process_ddos_attack()` and `LLMAnalyser`'s hard-timeout backstop (`_run_with_hard_timeout`):** both are verified manually/functionally (real nmap scans, a real hung-LLM reproduction and fix) but don't yet have dedicated `pytest` coverage the way `PortScanTracker` now does. Tracked here explicitly rather than left implicit — see Phase 5.5.
 - [ ] **A dedicated aggregate-pattern classifier for `ddos_tracker`/`port_scan_tracker` samples:** these are currently excluded from `AttackClassifier` training (see Phase 2.3's `TRAINING_LABEL_SOURCES` fix) because their synthetic, aggregate-level feature schema is fundamentally incompatible with the real per-flow features the main classifier uses. The samples themselves are still stored and are real, deterministic, confidently-labelled data — a small, separate model trained specifically on the aggregate-pattern schema (window size, distinct port/source counts) could be a worthwhile future addition, rather than just leaving this data permanently unused.
 - [ ] **Environment notes (for future reference / README "Troubleshooting" section):**
