@@ -2,7 +2,7 @@
 
 **Real-time network threat detection and response.**
 
-Sentinel is an AI-powered Network Intrusion Detection and Response System (NIDRS) built from scratch — no pre-packaged datasets, no inherited code. It's being built in phases (see [`PHASES.md`](PHASES.md)); **Phase 1 (capture, feature extraction, and detection) and Phase 2 (supervised classification, LLM self-labelling, and port-scan detection) are both complete and verified against real attack traffic.** Later phases (auto-blocking, GeoIP, alerting, web dashboard) are planned and tracked in the roadmap below.
+Sentinel is an AI-powered Network Intrusion Detection and Response System (NIDRS) built from scratch — no pre-packaged datasets, no inherited code. It's being built in phases (see [`PHASES.md`](PHASES.md)); **Phase 1 (capture, feature extraction, and detection) and Phase 2 (supervised classification, LLM self-labelling, and port-scan detection) are both complete and verified against real attack traffic.** **Phase 3 (auto-blocking, GeoIP, alerting) is code-complete and wired in — a real nmap scan has been detected, blocked via nftables, and confirmed unreachable end-to-end — but it isn't fully done yet:** alerting channels are untested against real destinations, the iptables fallback path and the DDoS alert-only branch haven't been exercised by real traffic, block expiry hasn't been directly observed, and there's zero test coverage for any of it (see [`PHASES.md`](PHASES.md) Phase 3 for the full gap list). The web dashboard (Phase 4) is planned and tracked in the roadmap below.
 
 ![Tests](https://github.com/Manav-1200/sentinel/actions/workflows/test.yml/badge.svg)
 ![Python](https://img.shields.io/badge/python-3.11+-blue)
@@ -21,7 +21,7 @@ Most intrusion detection projects train on a pre-labelled dataset (like CIC-IDS2
 5. An **LLM analyser** (NVIDIA NIM by default, Anthropic Claude as an optional alternative) reasons over flagged flows and assigns attack-type labels — used only offline, as a bootstrapping/labelling tool, never at runtime. Every LLM-labelled flow becomes a training example.
 6. A **supervised classifier** (RandomForest/XGBoost, whichever wins evaluation by macro F1) trains on those accumulated labels and adds a specific attack-type prediction alongside the anomaly detector's verdict — without ever overriding it. The classifier only adds detail to a flow already flagged by a rule-based or statistical mechanism; it deliberately never has the authority to promote or demote a verdict, since it's trained on a comparatively small, still-growing dataset and a wrong "benign" classification suppressing a real detection would be a far worse failure than an unlabelled one.
 
-Auto-blocking and GeoIP-tagged alerts follow in Phase 3.
+Auto-blocking and GeoIP-tagged alerts are built and wired in as of Phase 3 — real detection has already triggered a real nftables block against a genuinely separate attacking source. Full end-to-end verification of alerting and a few other edge cases is still outstanding (see below).
 
 The result is a system that genuinely improves the longer it runs — and that's fully understood because every part of it was built and debugged from scratch, including discovering and fixing several real production-grade issues (kernel-level packet loss under load, Isolation Forest sensitivity dilution from constant features, LLM prompt bias in both directions, and an SDK-retry-induced hang in the LLM analysis path) documented in detail in `docs/performance.md` and the codebase itself.
 
@@ -42,10 +42,14 @@ The result is a system that genuinely improves the longer it runs — and that's
 - JSON-lines detection logging
 - Automated tests (`pytest`) covering core Phase 1 modules, the DDoS tracker, and the port-scan tracker, run on every push via GitHub Actions (99 passing tests, 72%+ coverage) — the self-labelling pipeline, classifier, and LLM analyser have solid test coverage too; `main.py`'s wiring and the CLI display are verified manually/functionally rather than via dedicated unit tests
 
+**Built, code-complete, partially verified (Phase 3 — not yet tagged done, see [`PHASES.md`](PHASES.md) for the full gap list):**
+- Auto-blocking — nftables preferred (dedicated table/set, native kernel-timeout expiry), iptables fallback with a manual expiry-sweep thread; whitelist/private-range safety checks; dry-run support. **Verified:** a real block via nftables, end-to-end. **Not yet verified:** block expiry completing, or the iptables fallback path at all.
+- GeoIP lookup (`ip-api.com` primary / MaxMind GeoLite2 fallback) with an in-memory LRU cache and a private-IP short-circuit, wired into both logging and alerting
+- Alerting via email, Slack, or generic webhook, each fully channel-isolated, with per-source-IP rate limiting and GeoIP-enriched messages. **Not yet verified:** delivery to a real inbox/workspace/webhook — no `.env` credentials configured yet
+- Response wiring via `main.py`'s `build_response_stack()`/`handle_attack_response()` at three ATTACK-transition points (per-flow, DDoS-aggregate alert-only, per-source port-scan). **Not yet verified:** the DDoS alert-only branch, since no real multi-source DDoS traffic has been generated
+- Zero automated test coverage so far for any Phase 3 module
+
 **Planned (see [`PHASES.md`](PHASES.md) for the full roadmap):**
-- Auto-blocking via `iptables` / `nftables` with configurable expiry (Phase 3)
-- GeoIP lookup (city, country, ISP, coordinates) for every attacker IP (Phase 3)
-- Alerting via email, Slack, or generic webhook (Phase 3)
 - Live web dashboard: real-time attack feed, world map, blocked IP table, model stats (Phase 4)
 - Auto-retraining pipeline with model versioning and rollback (Phase 5)
 
@@ -110,7 +114,7 @@ cp .env.example .env            # Add your API keys and credentials (LLM provide
 
 Open `config.yaml` and check:
 - `capture.interfaces: "auto"` — auto-detects every active interface; override with an explicit list (e.g. `["wlo1", "enp2s0"]`) if you only want specific ones. **If you plan to test against Docker-container-sourced traffic** (see step 6 below), make sure your interface list or `"auto"` setting includes `docker0` — container traffic does not traverse your WiFi/Ethernet interface directly.
-- `response.dry_run: true` — keep this on; auto-blocking isn't implemented yet (Phase 3), this flag is forward-looking config
+- `response.dry_run` — auto-blocking is now implemented (Phase 3, code-complete); keep `true` unless you specifically want live nftables/iptables rules applied. Also check `response.block_private_ranges` — set `true` if your real network is entirely private-range (e.g. a typical home LAN + Docker bridge), otherwise blocking will silently no-op against your own test traffic
 - `llm.provider` — `"nim"` (NVIDIA NIM, free tier, default) or `"anthropic"` (requires prepaid API credit)
 - `port_scan.*` — thresholds for the per-source port-scan tracker (window size, distinct-port thresholds for SUSPICIOUS/ATTACK)
 
@@ -187,7 +191,7 @@ This project is built in five phases, each a demonstrable milestone:
 |-------|-------------|
 | 1 — Foundation | Capture + feature extraction + anomaly/flood/DDoS detection (CLI) — ✅ complete |
 | 2 — Intelligence | Supervised ML + LLM log analysis + self-labelling + port-scan detection — ✅ complete |
-| 3 — Response | Auto-blocking + GeoIP + alerting |
+| 3 — Response | Auto-blocking + GeoIP + alerting — 🟡 code-complete, not fully verified |
 | 4 — Dashboard | Live web UI with world map |
 | 5 — Production | Auto-retraining + model versioning + Docker |
 
@@ -197,7 +201,8 @@ See [`PHASES.md`](PHASES.md) for the detailed task checklist.
 
 ## Known issues
 
-- Under some conditions (observed specifically when `main.py`'s stdout is redirected to a non-terminal, e.g. piped to a log file in a script), `SIGINT` does not reliably produce a clean shutdown — the process has to be force-killed (`SIGKILL`) instead. This means any in-flight flow at the moment of a forced kill is lost rather than flushed. Root cause not yet identified (suspected interaction between Rich's `Live` display and non-tty stdout); a clean interactive Ctrl+C in a real terminal has not shown this issue. Tracked for a fix before Phase 3.
+- **Fixed:** the previous `SIGINT`/shutdown hang has been resolved. Root cause turned out to be Scapy's blocking `sniff()`, which only checks `stop_filter` after a packet actually arrives — not the non-tty-stdout/Rich `Live` interaction originally suspected, which was a red herring. Fixed by switching to `AsyncSniffer`.
+- Phase 3 (auto-blocking, GeoIP, alerting) is code-complete and has one confirmed real end-to-end block, but several parts remain unverified: alerting channels haven't been tested against real destinations, the iptables fallback backend hasn't been exercised, the DDoS alert-only path hasn't seen real multi-source traffic, block expiry hasn't been directly observed completing, and there's no automated test coverage yet for any Phase 3 module. See `PHASES.md` Phase 3 for the full list.
 - `Labeller`'s port-scan/DDoS methods, `AttackClassifier`, and `LLMAnalyser` are verified manually/functionally against real traffic but do not yet have dedicated automated test coverage (`PortScanTracker` itself now does — see the "Run the test suite" section above).
 - `ddos_tracker` and `port_scan_tracker` labelled samples are stored for record-keeping/audit but are deliberately excluded from classifier training (`TRAINING_LABEL_SOURCES = {"llm"}` in `detection/classifier.py`) — their synthetic, aggregate-pattern feature set (window size, distinct port/source counts) doesn't match the ~30 real per-flow features the classifier is trained and queried against. Discovered during Phase 2.5 verification, before tagging v2.0.
 
@@ -223,9 +228,9 @@ See [`docs/safety.md`](docs/safety.md) for full details and recovery instruction
 | ML (classifier) | scikit-learn (RandomForest) / XGBoost — best of both by macro F1, complete |
 | Aggregate detection | Custom sliding-window rate tracker (DDoS) + per-source distinct-port tracker (port scan) |
 | LLM | NVIDIA NIM (default, free tier) / Claude API (Anthropic, optional) — self-labelling pipeline, complete |
-| Blocking | iptables / nftables — planned, Phase 3 |
-| GeoIP | ip-api.com, MaxMind GeoLite2 — planned, Phase 3 |
-| Alerting | SMTP, Slack webhooks — planned, Phase 3 |
+| Blocking | nftables (preferred) / iptables (fallback) — Phase 3, code-complete, real block verified; expiry + iptables path still untested |
+| GeoIP | ip-api.com, MaxMind GeoLite2 — Phase 3, code-complete |
+| Alerting | SMTP, Slack webhooks, generic webhook — Phase 3, code-complete; delivery to real destinations not yet tested |
 | Dashboard | FastAPI, React / Streamlit, Leaflet.js — planned, Phase 4 |
 | Storage | SQLite → PostgreSQL — planned, Phase 4/5 |
 | CI | GitHub Actions |
