@@ -29,7 +29,7 @@ def make_config(**overrides):
     return {"alerting": alerting}
 
 
-def make_event(src_ip="198.51.100.5", attack_type="port_scan"):
+def make_event(src_ip="198.51.101.5", attack_type="port_scan"):
     return AlertEvent(
         attack_type=attack_type,
         src_ip=src_ip,
@@ -57,8 +57,8 @@ class TestRateLimiting:
         manager = AlertManager(make_config(email={"enabled": True, "sender": "a@x.com",
                                                     "recipient": "b@x.com"}))
         with patch.object(manager, "_send_email") as mock_send:
-            manager.send_alert(make_event(src_ip="198.51.100.5"))
-            manager.send_alert(make_event(src_ip="198.51.100.6"))
+            manager.send_alert(make_event(src_ip="198.51.101.5"))
+            manager.send_alert(make_event(src_ip="198.51.101.6"))
 
         assert mock_send.call_count == 2
 
@@ -88,13 +88,16 @@ class TestChannelIsolation:
         )
         manager = AlertManager(config)
         manager._requests = MagicMock()
-        manager._requests.post.return_value = MagicMock(raise_for_status=lambda: None)
 
-        with patch.object(manager, "_send_email", side_effect=RuntimeError("smtp down")):
-            # Should not raise, and slack should still be attempted.
+        with patch.object(manager, "_send_email", side_effect=RuntimeError("smtp down")), \
+             patch.object(manager, "_send_slack") as mock_slack:
+            # Should not raise, and slack should still be attempted —
+            # NOT mocking _send_slack via a fake webhook URL/env var,
+            # since a missing SENTINEL_SLACK_WEBHOOK would fail slack
+            # too and mask exactly the isolation behaviour under test.
             manager.send_alert(make_event())
 
-        manager._requests.post.assert_called_once()
+        mock_slack.assert_called_once()
 
     def test_send_alert_never_raises_even_if_every_channel_fails(self):
         config = make_config(
@@ -167,7 +170,7 @@ class TestMessageFormatting:
         subject, body = manager._format_message(make_event(), location="Nepal")
 
         assert "port_scan" in subject
-        assert "198.51.100.5" in subject
+        assert "198.51.101.5" in subject
         assert "touched 30 ports in 10s" in body
         assert "distinct_ports_in_window: 30" in body
 
@@ -181,5 +184,5 @@ class TestMessageFormatting:
             manager._send_test_alert()
 
         assert mock_send.called
-        subject = mock_send.call_args.args[1]
+        subject = mock_send.call_args.args[0]
         assert "TEST" in subject
