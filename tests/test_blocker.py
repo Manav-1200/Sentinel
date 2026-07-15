@@ -79,25 +79,25 @@ class TestDryRun:
         with patch("response.blocker.shutil.which", return_value="/usr/bin/nft"), \
              patch("response.blocker.subprocess.run") as mock_run:
             blocker = IPBlocker(make_config(tmp_path, dry_run=True))
-            result = blocker.block("203.0.113.5", reason="test")
+            result = blocker.block("203.0.114.5", reason="test")
 
         mock_run.assert_not_called()
         assert result.applied is False
         assert result.dry_run is True
         # Dry run still tracks the "would-be" block so is_blocked()
         # reflects intent for display/testing purposes.
-        assert blocker.is_blocked("203.0.113.5") is True
+        assert blocker.is_blocked("203.0.114.5") is True
 
     def test_dry_run_unblock_never_calls_subprocess(self, tmp_path):
         with patch("response.blocker.shutil.which", return_value="/usr/bin/nft"), \
              patch("response.blocker.subprocess.run") as mock_run:
             blocker = IPBlocker(make_config(tmp_path, dry_run=True))
-            blocker.block("203.0.113.5")
-            result = blocker.unblock("203.0.113.5")
+            blocker.block("203.0.114.5")
+            result = blocker.unblock("203.0.114.5")
 
         mock_run.assert_not_called()
         assert result.applied is False
-        assert blocker.is_blocked("203.0.113.5") is False
+        assert blocker.is_blocked("203.0.114.5") is False
 
 
 # ------------------------------------------------------------
@@ -107,7 +107,7 @@ class TestDryRun:
 class TestSafetyChecks:
     def test_whitelisted_ip_never_blocked(self, tmp_path):
         with patch("response.blocker.shutil.which", return_value="/usr/bin/nft"), \
-             patch("response.blocker.subprocess.run") as mock_run:
+             patch("response.blocker.subprocess.run", side_effect=fake_subprocess_run_success) as mock_run:
             blocker = IPBlocker(make_config(tmp_path, dry_run=False, whitelist_ips=["8.8.8.8"]))
             mock_run.reset_mock()  # clear the setup() calls
             result = blocker.block("8.8.8.8")
@@ -119,7 +119,7 @@ class TestSafetyChecks:
 
     def test_loopback_never_blocked_even_if_private_ranges_allowed(self, tmp_path):
         with patch("response.blocker.shutil.which", return_value="/usr/bin/nft"), \
-             patch("response.blocker.subprocess.run") as mock_run:
+             patch("response.blocker.subprocess.run", side_effect=fake_subprocess_run_success) as mock_run:
             blocker = IPBlocker(make_config(tmp_path, dry_run=False, block_private_ranges=True))
             mock_run.reset_mock()
             result = blocker.block("127.0.0.1")
@@ -130,7 +130,7 @@ class TestSafetyChecks:
 
     def test_private_ip_skipped_by_default(self, tmp_path):
         with patch("response.blocker.shutil.which", return_value="/usr/bin/nft"), \
-             patch("response.blocker.subprocess.run") as mock_run:
+             patch("response.blocker.subprocess.run", side_effect=fake_subprocess_run_success) as mock_run:
             blocker = IPBlocker(make_config(tmp_path, dry_run=False, block_private_ranges=False))
             mock_run.reset_mock()
             result = blocker.block("192.168.10.67")
@@ -168,14 +168,14 @@ class TestRealBackendCalls:
              patch("response.blocker.subprocess.run", side_effect=fake_subprocess_run_success) as mock_run:
             blocker = IPBlocker(make_config(tmp_path, dry_run=False))
             mock_run.reset_mock()
-            result = blocker.block("203.0.113.9", reason="port_scan")
+            result = blocker.block("203.0.114.9", reason="port_scan")
 
         assert result.applied is True
         # Confirm the actual nft command shape hit the set, not some
         # other accidental call.
         called_cmds = [call.args[0] for call in mock_run.call_args_list]
-        assert any("element" in cmd and "203.0.113.9" in " ".join(cmd) for cmd in called_cmds)
-        assert blocker.is_blocked("203.0.113.9") is True
+        assert any("element" in cmd and "203.0.114.9" in " ".join(cmd) for cmd in called_cmds)
+        assert blocker.is_blocked("203.0.114.9") is True
 
     def test_backend_failure_reports_applied_false_not_true(self, tmp_path):
         """
@@ -199,19 +199,19 @@ class TestRealBackendCalls:
             blocker = IPBlocker(make_config(tmp_path, dry_run=False))
 
         with patch("response.blocker.subprocess.run", side_effect=failing_run):
-            result = blocker.block("203.0.113.10", reason="port_scan")
+            result = blocker.block("203.0.114.10", reason="port_scan")
 
         assert result.applied is False
         assert result.reason  # some error detail present
-        assert blocker.is_blocked("203.0.113.10") is False
+        assert blocker.is_blocked("203.0.114.10") is False
 
     def test_null_backend_never_reports_false_success(self, tmp_path):
         with patch("response.blocker.shutil.which", return_value=None):
             blocker = IPBlocker(make_config(tmp_path, dry_run=False))
-            result = blocker.block("203.0.113.11", reason="port_scan")
+            result = blocker.block("203.0.114.11", reason="port_scan")
 
         assert result.applied is False
-        assert blocker.is_blocked("203.0.113.11") is False
+        assert blocker.is_blocked("203.0.114.11") is False
 
 
 # ------------------------------------------------------------
@@ -222,21 +222,21 @@ class TestBookkeeping:
     def test_currently_blocked_excludes_expired_entries(self, tmp_path):
         with patch("response.blocker.shutil.which", return_value="/usr/bin/nft"):
             blocker = IPBlocker(make_config(tmp_path, dry_run=True, block_duration_minutes=0.001))
-            blocker.block("203.0.113.12")
+            blocker.block("203.0.114.12")
             time.sleep(0.1)  # let the 0.001-minute (60ms) expiry pass
 
-        assert blocker.is_blocked("203.0.113.12") is False
-        assert "203.0.113.12" not in blocker.currently_blocked()
+        assert blocker.is_blocked("203.0.114.12") is False
+        assert "203.0.114.12" not in blocker.currently_blocked()
 
     def test_unblock_removes_from_bookkeeping(self, tmp_path):
         with patch("response.blocker.shutil.which", return_value="/usr/bin/nft"), \
              patch("response.blocker.subprocess.run", side_effect=fake_subprocess_run_success):
             blocker = IPBlocker(make_config(tmp_path, dry_run=False))
-            blocker.block("203.0.113.13")
-            assert blocker.is_blocked("203.0.113.13") is True
-            blocker.unblock("203.0.113.13")
+            blocker.block("203.0.114.13")
+            assert blocker.is_blocked("203.0.114.13") is True
+            blocker.unblock("203.0.114.13")
 
-        assert blocker.is_blocked("203.0.113.13") is False
+        assert blocker.is_blocked("203.0.114.13") is False
 
 
 # ------------------------------------------------------------
@@ -247,12 +247,12 @@ class TestAuditLog:
     def test_block_action_written_to_audit_log(self, tmp_path):
         with patch("response.blocker.shutil.which", return_value="/usr/bin/nft"):
             blocker = IPBlocker(make_config(tmp_path, dry_run=True))
-            blocker.block("203.0.113.14", reason="test-reason")
+            blocker.block("203.0.114.14", reason="test-reason")
 
         log_path = tmp_path / "blocks.log"
         assert log_path.exists()
         entry = json.loads(log_path.read_text().strip().splitlines()[-1])
-        assert entry["ip"] == "203.0.113.14"
+        assert entry["ip"] == "203.0.114.14"
         assert entry["action"] == "block"
         assert entry["reason"] == "test-reason"
         assert entry["dry_run"] is True
@@ -268,7 +268,7 @@ class TestIptablesExpirySweep:
              patch("response.blocker.subprocess.run", side_effect=fake_subprocess_run_success):
             blocker = IPBlocker(make_config(tmp_path, dry_run=False, block_duration_minutes=0.001))
             assert isinstance(blocker._backend, _IptablesBackend)
-            blocker.block("203.0.113.15")
+            blocker.block("203.0.114.15")
 
             # Directly invoke the sweep body once instead of waiting
             # 15s for the real timer — this exercises the exact same
@@ -277,11 +277,11 @@ class TestIptablesExpirySweep:
             now = time.time() + 1  # simulate time having passed
             with patch("response.blocker.time.time", return_value=now):
                 expired = [ip for ip, expiry in blocker._blocked_until.items() if expiry <= now]
-                assert "203.0.113.15" in expired
+                assert "203.0.114.15" in expired
                 for ip in expired:
                     blocker._backend.unblock(ip)
                     blocker._blocked_until.pop(ip, None)
 
             blocker.shutdown()
 
-        assert blocker.is_blocked("203.0.113.15") is False
+        assert blocker.is_blocked("203.0.114.15") is False

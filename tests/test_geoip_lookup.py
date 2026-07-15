@@ -62,7 +62,7 @@ class TestApiBackend:
         }
         with patch.object(lookup, "_requests") as mock_requests:
             mock_requests.get.return_value = fake_response
-            result = lookup.lookup("203.0.113.5")
+            result = lookup.lookup("203.0.114.5")
 
         assert result.resolved is True
         assert result.city == "Kathmandu"
@@ -73,7 +73,7 @@ class TestApiBackend:
         lookup = GeoIPLookup(make_config(method="api"))
         with patch.object(lookup, "_requests") as mock_requests:
             mock_requests.get.side_effect = RuntimeError("network unreachable")
-            result = lookup.lookup("203.0.113.6")
+            result = lookup.lookup("203.0.114.6")
 
         assert result.resolved is False
         assert result.error is not None
@@ -84,7 +84,7 @@ class TestApiBackend:
         fake_response.json.return_value = {"status": "fail", "message": "rate limited"}
         with patch.object(lookup, "_requests") as mock_requests:
             mock_requests.get.return_value = fake_response
-            result = lookup.lookup("203.0.113.7")
+            result = lookup.lookup("203.0.114.7")
 
         assert result.resolved is False
         assert result.error == "rate limited"
@@ -97,7 +97,7 @@ class TestApiBackend:
         }
         with patch.object(lookup, "_requests") as mock_requests:
             mock_requests.get.return_value = fake_response
-            result = lookup.lookup("203.0.113.8")
+            result = lookup.lookup("203.0.114.8")
 
         assert result.resolved is True
         assert result.asn is None
@@ -105,7 +105,7 @@ class TestApiBackend:
     def test_no_requests_library_available_returns_unresolved(self):
         lookup = GeoIPLookup(make_config(method="api"))
         lookup._requests = None  # simulate 'requests' not installed
-        result = lookup.lookup("203.0.113.9")
+        result = lookup.lookup("203.0.114.9")
         assert result.resolved is False
         assert result.error == "no GeoIP backend available"
 
@@ -133,7 +133,7 @@ class TestMaxmindBackend:
         with patch("detection.geoip_lookup.GeoIPLookup._try_open_maxmind_reader", return_value=fake_reader):
             lookup = GeoIPLookup(make_config(method="maxmind"))
 
-        result = lookup.lookup("203.0.113.10")
+        result = lookup.lookup("203.0.114.10")
         assert result.resolved is True
         assert result.city == "Kathmandu"
         assert result.country == "Nepal"
@@ -150,8 +150,8 @@ class TestCaching:
         fake_response.json.return_value = {"status": "success", "country": "Nepal"}
         with patch.object(lookup, "_requests") as mock_requests:
             mock_requests.get.return_value = fake_response
-            lookup.lookup("203.0.113.20")
-            lookup.lookup("203.0.113.20")
+            lookup.lookup("203.0.114.20")
+            lookup.lookup("203.0.114.20")
 
         assert mock_requests.get.call_count == 1
 
@@ -161,13 +161,13 @@ class TestCaching:
         fake_response.json.return_value = {"status": "success", "country": "Nepal"}
         with patch.object(lookup, "_requests") as mock_requests:
             mock_requests.get.return_value = fake_response
-            lookup.lookup("203.0.113.21")
-            lookup.lookup("203.0.113.22")
-            lookup.lookup("203.0.113.23")  # should evict .21 (least recently used)
+            lookup.lookup("203.0.114.21")
+            lookup.lookup("203.0.114.22")
+            lookup.lookup("203.0.114.23")  # should evict .21 (least recently used)
 
-        assert "203.0.113.21" not in lookup._cache
-        assert "203.0.113.22" in lookup._cache
-        assert "203.0.113.23" in lookup._cache
+        assert "203.0.114.21" not in lookup._cache
+        assert "203.0.114.22" in lookup._cache
+        assert "203.0.114.23" in lookup._cache
 
 
 # ------------------------------------------------------------
