@@ -133,7 +133,9 @@ response:
 
   # How long (in minutes) a blocked IP stays blocked before
   # the rule is automatically removed.
-  block_duration_minutes: 60
+  # TEMPORARY: set to 1 for expiry testing — bump back to a real
+  # duration (e.g. 60) once you're done watching blocks expire.
+  block_duration_minutes: 1
 
   # IPs that will NEVER be blocked regardless of score.
   # Always include your router gateway and any trusted machines.
@@ -142,17 +144,22 @@ response:
     - "::1"
     - "192.168.1.1"   # <-- replace with your router IP
 
-  # Block private/LAN IP ranges? Almost always false unless
-  # you are specifically hunting for insider threats on the LAN.
+  # Block private/LAN IP ranges? Almost always false unless you are
+  # specifically hunting for insider threats on the LAN — but true
+  # here since Azazel's whole real network (192.168.x.x LAN,
+  # 172.17.x.x Docker bridge) is private-range, so leaving this false
+  # would make blocking a no-op against all real test traffic.
   block_private_ranges: true
 
 # ------------------------------------------------------------
 # Alerting settings
 # ------------------------------------------------------------
 alerting:
-  # Set to true to send a test alert on startup and verify
-  # that your alert channels are configured correctly.
-  test_on_startup: false
+  # Set to true to send a test alert on startup and verify that your
+  # alert channels are configured correctly.
+  # TEMPORARY: leave true while verifying webhook delivery, then set
+  # back to false so you're not getting a synthetic alert every run.
+  test_on_startup: true
 
   # Minimum seconds between alerts for the same source IP.
   # Prevents alert storms when one IP probes repeatedly.
@@ -172,7 +179,7 @@ alerting:
     # Set webhook URL in .env: SENTINEL_SLACK_WEBHOOK
 
   webhook:
-    enabled: false
+    enabled: true
     # Set URL in .env: SENTINEL_WEBHOOK_URL
 
 # ------------------------------------------------------------
