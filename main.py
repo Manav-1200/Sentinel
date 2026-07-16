@@ -194,6 +194,37 @@ class _NoOpBlocker:
 _NoOpBlocker.instance = _NoOpBlocker()
 
 
+def _is_multicast_or_broadcast_destination(dst_ip) -> bool:
+    """
+    True if `dst_ip` is a multicast (224.0.0.0/4, e.g. SSDP/UPnP's
+    239.255.255.250, mDNS's 224.0.0.251) or the universal broadcast
+    address (255.255.255.255).
+
+    Why this exists: this kind of traffic is normal LAN background
+    noise (device discovery, mDNS, etc.), but an unusual burst of it
+    can still legitimately trip the anomaly detector's SUSPICIOUS
+    threshold. When that happens, the Phase 2 classifier — trained on
+    a still-small, LLM-labelled dataset — has been observed guessing
+    "ddos" for it (confirmed via live testing, 2026-07-15), which is
+    misleading on the live display and, worse, gets stored as a
+    training sample via labeller.process(), reinforcing the same
+    wrong guess on future runs.
+
+    This check is used ONLY to gate the classifier's attack-type
+    label and training-sample storage for such flows — never to
+    suppress the verdict or blocking. SSDP-amplification is a real,
+    documented DDoS technique; a genuine attack must still be
+    detected and (if it crosses ATTACK) blocked/alerted on. This gate
+    only stops a mislabelled GUESS from being shown or learned from.
+    """
+    try:
+        import ipaddress
+        addr = ipaddress.ip_address(dst_ip)
+    except (ValueError, TypeError):
+        return False
+    return addr.is_multicast or str(addr) == "255.255.255.255"
+
+
 def _record_attack_event(attack_events: list, attack_type: str, src_ip: str,
                           reasoning: str, block_result) -> None:
     """
@@ -350,6 +381,18 @@ def run_live_capture(config: dict) -> None:
                 result = detector.predict(features)
                 display.dropped_packet_count = sniffer.dropped_packet_count
 
+                # Multicast/broadcast destinations (SSDP/UPnP, mDNS,
+                # etc.) are normal LAN chatter that can still trip
+                # SUSPICIOUS on an unusual burst — but the classifier
+                # has been observed guessing "ddos" for this pattern,
+                # which is misleading on screen and, if labelled,
+                # reinforces the same wrong guess in future training.
+                # See _is_multicast_or_broadcast_destination()'s
+                # docstring — verdict/blocking are NOT affected here,
+                # only the classifier label and training-sample
+                # storage below.
+                is_multicast_dst = _is_multicast_or_broadcast_destination(features.get("dst_ip"))
+
                 # If a trained classifier is available AND the anomaly
                 # detector already flagged this flow, ask the classifier
                 # for a specific attack-type prediction to show alongside
@@ -359,7 +402,7 @@ def run_live_capture(config: dict) -> None:
                 # docstring discussion / PHASES.md for why detection and
                 # classification stay as separate, composable layers).
                 predicted_label = None
-                if classifier is not None and result.verdict.value in ("SUSPICIOUS", "ATTACK"):
+                if classifier is not None and not is_multicast_dst and result.verdict.value in ("SUSPICIOUS", "ATTACK"):
                     try:
                         predicted_label, _ = classifier.predict(features)
                     except Exception:
@@ -379,7 +422,16 @@ def run_live_capture(config: dict) -> None:
                 # future Phase 2 classifier. Runs after display/logging
                 # so a slow or failed LLM call never delays what the
                 # operator sees on screen.
-                labeller.process(result)
+                #
+                # Skipped for multicast/broadcast-destination flows —
+                # see _is_multicast_or_broadcast_destination()'s
+                # docstring. Storing these as training samples is
+                # exactly how the classifier learned to mislabel this
+                # normal LAN chatter as "ddos" in the first place; a
+                # wrong label fed back into training only reinforces
+                # itself. Detection/logging above are untouched.
+                if not is_multicast_dst:
+                    labeller.process(result)
 
                 # Phase 3: a per-flow ATTACK verdict here is always
                 # either the deterministic flood-guard or an
@@ -544,8 +596,13 @@ def run_pcap(config: dict, pcap_path: str) -> None:
                     continue
                 result = detector.predict(features)
 
+                # See _is_multicast_or_broadcast_destination()'s
+                # docstring — gates the classifier label and training
+                # storage only, never verdict/blocking.
+                is_multicast_dst = _is_multicast_or_broadcast_destination(features.get("dst_ip"))
+
                 predicted_label = None
-                if classifier is not None and result.verdict.value in ("SUSPICIOUS", "ATTACK"):
+                if classifier is not None and not is_multicast_dst and result.verdict.value in ("SUSPICIOUS", "ATTACK"):
                     try:
                         predicted_label, _ = classifier.predict(features)
                     except Exception:
@@ -553,7 +610,8 @@ def run_pcap(config: dict, pcap_path: str) -> None:
 
                 display.add(result, predicted_label=predicted_label)
                 logger.log(result)
-                labeller.process(result)
+                if not is_multicast_dst:
+                    labeller.process(result)
 
                 if result.verdict.value == "ATTACK":
                     src_ip = features.get("src_ip")
