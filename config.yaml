@@ -279,3 +279,10 @@ dashboard:
 
   # How many recent flows to return from /api/flows/recent.
   recent_flows_limit: 100
+
+  ddos:
+  window_seconds: 10.0
+  attack_total_flows_threshold: 500
+  attack_distinct_sources_threshold: 20
+  suspicious_total_flows_threshold: 200
+  suspicious_distinct_sources_threshold: 10
