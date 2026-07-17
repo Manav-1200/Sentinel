@@ -679,10 +679,24 @@ def run_pcap(config: dict, pcap_path: str) -> None:
                             attack_events, "port_scan", port_scan_result.src_ip, reasoning, block_result,
                         )
                     last_port_scan_verdict_by_source[flow.src_ip] = port_scan_result.verdict
+        replay_completed = True
+    except KeyboardInterrupt:
+        # Bug fix (found 2026-07-17): this except clause was missing
+        # entirely — run_pcap() only had the `finally: blocker.shutdown()`
+        # below, so Ctrl+C during a long replay propagated straight up
+        # through whatever sklearn/detector call was mid-flight and
+        # crashed with a raw traceback instead of shutting down
+        # cleanly. run_live_capture() already had this same handling;
+        # it just never got mirrored here. Matches that function's
+        # behaviour now: acknowledge the interrupt, then still show
+        # the shutdown report below for whatever was processed so far.
+        replay_completed = False
+        console.print("\n[yellow]Replay interrupted.[/yellow] Flushing current window.")
     finally:
         blocker.shutdown()
 
-    console.print("[green]Pcap replay complete.[/green]")
+    if replay_completed:
+        console.print("[green]Pcap replay complete.[/green]")
     print_shutdown_report(display, blocker, attack_events)
 
 
