@@ -437,3 +437,4 @@ class _NullBackend:
 
     def unblock(self, ip: str) -> None:
         raise RuntimeError("no firewall backend available (neither 'nft' nor 'iptables' found on PATH)")
+
