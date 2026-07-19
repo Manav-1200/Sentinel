@@ -73,6 +73,22 @@ still stored in the database in full — they remain valuable for
 record-keeping, auditing, and any FUTURE dedicated aggregate-pattern
 model — but they must never be fed to THIS classifier, which is
 trained and queried exclusively on real per-flow features.
+
+Feature set note (added alongside the bulk-transfer/ddos confusion
+fix, July 2026):
+--------------------------------------------------------------------
+`_get_feature_order()` picks up whatever numeric keys exist on the
+first usable sample, so new features (e.g. ack_ratio,
+fwd_packet_share, bwd_fwd_packet_ratio, iat_cv — added to
+features/extractor.py to fix a real mislabelling of legitimate
+high-volume transfers as "ddos") are picked up automatically here,
+with no code change required in this file. The only action needed
+when features/extractor.py's schema changes is deleting any
+previously-saved classifier model (see models.model_dir in
+config.yaml) — a loaded model's stored feature_order reflects
+whatever schema existed when IT was trained/saved, not the current
+one, so an old model will keep scoring on a stale, incomplete column
+set until retrained from scratch.
 """
 
 from __future__ import annotations

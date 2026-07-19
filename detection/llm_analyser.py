@@ -17,16 +17,23 @@ score into a labelled, explainable training example.
 Provider abstraction:
 -----------------------
 Built against TWO interchangeable providers from day one:
-  - NVIDIA NIM (default) — free tier, OpenAI-compatible API. Chosen
-    as the default specifically because it requires no prepaid
-    credit, unlike the Anthropic API.
+  - NVIDIA NIM (default) — free tier, OpenAI-compatible REST API.
+    Chosen as the default specifically because it requires no
+    prepaid credit.
   - Anthropic Claude — optional alternative, used if explicitly
     configured (requires prepaid API credit).
 
-Both are accessed through a single `analyse()` function with the same
-input/output shape, so the rest of the pipeline never needs to know
-which provider is active. Switching providers is a one-line config
-change (`llm.provider` in config.yaml), not a code change.
+Both are called via plain HTTP (the `requests` library) rather than
+either provider's official Python SDK (added July 2026, deliberate
+choice — no vendor client library dependency is pulled into this
+project; both providers expose a documented REST API, and calling it
+directly with `requests` keeps the dependency footprint to one
+already-common HTTP library instead of two separate company-specific
+SDKs). Both providers are accessed through a single `analyse()`
+function with the same input/output shape, so the rest of the
+pipeline never needs to know which provider is active. Switching
+providers is a one-line config change (`llm.provider` in
+config.yaml), not a code change.
 
 Failure handling:
 -------------------
@@ -38,36 +45,41 @@ caller gets a clearly-marked "analysis unavailable" result rather than
 an exception that could crash the whole detection pipeline. A flaky
 LLM provider must never be able to take down live packet capture.
 
-Hard timeout backstop (added July 2026, after a real hang):
---------------------------------------------------------------
-Passing `timeout=...` to the OpenAI/Anthropic client constructor sets
-an HTTP-level timeout, but BOTH SDKs also retry failed/timed-out
-requests by default (typically max_retries=2, with backoff between
-attempts) — so a single configured timeout of, say, 10 seconds can
-silently become 30-40+ seconds in practice once retries are counted,
-and in rare cases (a hung TCP connection that never cleanly times out
-at the socket level, a proxy holding a connection open) could block
-far longer than that. Since `analyse()` is called synchronously from
-the main capture loop for every SUSPICIOUS/ATTACK flow, any hang here
-blocks live packet capture entirely — exactly the failure mode this
-module's docstring says must never happen.
+Hard timeout backstop (added July 2026, after a real hang; retained
+after the switch to raw `requests` calls):
+--------------------------------------------------------------------
+`requests` supports a native `timeout=` argument covering both the
+connect and read phases, and — unlike the OpenAI/Anthropic SDKs —
+does not retry failed/timed-out requests by default, so there is no
+equivalent risk of a configured timeout silently multiplying via
+built-in retry/backoff behaviour. Nonetheless, the same worker-thread
+hard deadline from the calling thread is kept as a backstop: a
+hung TCP connection, a proxy holding a connection open past what
+`requests`' own timeout handling catches, or any other edge case
+neither anticipated nor yet observed should still never be able to
+block the main capture loop indefinitely. `analyse()` is called
+synchronously from the main capture loop for every SUSPICIOUS/ATTACK
+flow, so any hang here blocks live packet capture entirely — exactly
+the failure mode this module's docstring says must never happen. The
+worker thread itself may still be blocked on the underlying socket
+after the deadline passes (Python cannot forcibly kill a thread) —
+but it's a daemon thread doing no shared-state mutation, so it is
+safe to simply abandon and let it die naturally when the network call
+eventually resolves or the process exits.
 
-Two independent fixes are applied:
-  1. Both clients are constructed with max_retries=0, so the SDK's
-     own retry/backoff behaviour can never multiply the configured
-     timeout.
-  2. The actual network call is additionally run in a worker thread
-     with a hard `future.result(timeout=...)` from the main thread.
-     This is a backstop that does not trust the SDK's own timeout
-     handling at all — even if a future SDK version changes its
-     retry defaults, or a connection hangs in a way neither timeout
-     nor max_retries catches, the calling thread can never block
-     longer than timeout_seconds + a small buffer. The worker thread
-     itself may still be blocked on the underlying socket after this
-     returns (Python cannot forcibly kill a thread) — but it's a
-     daemon thread doing no shared-state mutation, so it is safe to
-     simply abandon and let it die naturally when the network call
-     eventually resolves or the process exits.
+Directionality-aware prompt (added July 2026):
+--------------------------------------------------
+Real-world testing found the classifier mislabelling a legitimate
+16,133-packet HTTPS download as "ddos" — traced back to the training
+data (LLM-labelled samples) having essentially no high-volume
+"benign" examples, because the LLM was reasoning from packet count/rate
+alone and had no signal to separate "big legitimate transfer" from
+"flood" even if it wanted to. The prompt now surfaces
+fwd_packet_share and ack_ratio explicitly (see
+features/extractor.py's module docstring for the full feature
+rationale) and gives the LLM concrete guidance on how to use them,
+so it can correctly label high-volume-but-legitimate traffic as
+"benign" instead of defaulting to a volume-based guess.
 """
 
 from __future__ import annotations
@@ -80,6 +92,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
+
+import requests
 
 
 class AnalysisConfidence(str, Enum):
@@ -196,6 +210,15 @@ def _build_prompt(features: dict, anomaly_score: float, verdict: str) -> str:
     from a threshold. The quantitative guidance below gives it that
     anchor, so skepticism about the detector's verdict doesn't also
     mean skepticism about the actual numbers in front of it.
+
+    A third failure mode was found after that (confirmed via direct
+    testing, July 2026): a legitimate 16,133-packet HTTPS download was
+    labelled "ddos" purely on packet count/rate, because the prompt
+    had no signal to separate "big legitimate transfer" from "flood".
+    fwd_packet_share and ack_ratio are now surfaced explicitly, with
+    guidance on how to read them, so the LLM can correctly call
+    high-volume-but-legitimate traffic "benign" instead of guessing
+    from volume alone.
     """
     proto_names = {6: "TCP", 17: "UDP", 1: "ICMP"}
     protocol = proto_names.get(features.get("protocol"), str(features.get("protocol")))
@@ -211,6 +234,8 @@ def _build_prompt(features: dict, anomaly_score: float, verdict: str) -> str:
         f"({features.get('fwd_packets', 0)} forward, {features.get('bwd_packets', 0)} backward)",
         f"Packet rate: {features.get('packets_per_second', 0):.1f} packets/second",
         f"Byte rate: {features.get('bytes_per_second', 0):.1f} bytes/second",
+        f"Forward packet share: {features.get('fwd_packet_share', 0):.2f} "
+        f"({features.get('fwd_packets', 0)} forward / {features.get('bwd_packets', 0)} backward)",
     ]
 
     if protocol == "TCP":
@@ -220,10 +245,12 @@ def _build_prompt(features: dict, anomaly_score: float, verdict: str) -> str:
             f"RST={features.get('rst_count', 0)}"
         )
         lines.append(f"SYN ratio (SYN packets / total): {features.get('syn_ratio', 0):.2f}")
+        lines.append(f"ACK ratio (ACK packets / total): {features.get('ack_ratio', 0):.2f}")
 
     lines.append(f"Zero-payload packet ratio: {features.get('zero_payload_ratio', 0):.2f}")
     lines.append(f"Inter-arrival time: mean={features.get('iat_mean', 0):.4f}s, "
-                  f"std={features.get('iat_std', 0):.4f}s")
+                  f"std={features.get('iat_std', 0):.4f}s, "
+                  f"cv={features.get('iat_cv', 0):.2f}")
     lines.append("")
     lines.append(
         "An automated anomaly detector flagged this flow for review "
@@ -258,6 +285,31 @@ def _build_prompt(features: dict, anomaly_score: float, verdict: str) -> str:
         "pattern (high sustained one-directional packet rate) is a strong "
         "indicator of a flood/DoS-style attack (syn_flood for TCP with a high "
         "SYN ratio, ddos otherwise), even without other unusual features."
+    )
+    lines.append("")
+    lines.append(
+        "However, high packet count or rate ALONE is NOT sufficient evidence of "
+        "an attack -- forward packet share and ACK ratio distinguish a "
+        "legitimate high-volume transfer from a flood, even when total packet "
+        "count and rate look similar. A legitimate download or upload has a LOW "
+        "forward packet share (roughly 0.2-0.4 -- the server sends most of the "
+        "data back) and a HIGH ACK ratio (the connection is properly established "
+        "and acknowledging data normally). A real flood or syn_flood has a HIGH "
+        "forward packet share (often above 0.9 -- the target barely responds) "
+        "and a LOW ACK ratio (SYNs or data sent with no real handshake "
+        "completion). If forward/backward traffic looks like a normal "
+        "established connection despite the volume (low-to-moderate forward "
+        "share, high ACK ratio), label it 'benign' even at high packet counts."
+    )
+    lines.append("")
+    lines.append(
+        "Timing regularity (iat_cv, the coefficient of variation of "
+        "inter-arrival time) is another useful signal: a very low iat_cv means "
+        "packets are arriving at near-identical, machine-precise intervals -- "
+        "typical of a scripted flood or scan. A higher iat_cv means timing is "
+        "irregular, which is typical of normal traffic (including normal bursty "
+        "traffic like a large download, which is bursty because of network/OS "
+        "buffering, not driven by intent to overwhelm anything)."
     )
     lines.append("")
     lines.append(
@@ -321,74 +373,84 @@ def _parse_llm_response(raw_text: str) -> AnalysisResult:
 # ----------------------------------------------------------------------
 # Provider-specific call implementations
 # ----------------------------------------------------------------------
+# Both providers are called via plain `requests` HTTP calls rather
+# than either company's official SDK — see module docstring's
+# "Provider abstraction" section for why. This keeps the project's
+# dependency list to one general-purpose HTTP library instead of two
+# vendor-specific client packages.
+
 def _call_nim(prompt: str, config: dict, timeout_seconds: float) -> str:
     """
-    Call NVIDIA NIM's OpenAI-compatible API. Raises on any failure —
-    callers are responsible for catching and converting to a graceful
-    AnalysisResult(available=False, ...).
+    Call NVIDIA NIM's OpenAI-compatible chat completions REST endpoint
+    directly. Raises on any failure (network error, non-2xx response,
+    unexpected response shape) — callers are responsible for catching
+    and converting to a graceful AnalysisResult(available=False, ...).
 
-    max_retries=0: the OpenAI SDK retries failed/timed-out requests
-    twice by default, which would silently turn one configured
-    timeout into up to 3x that duration. Retries are disabled here
-    because analyse() already treats any failure as "unavailable" and
-    the calling pipeline moves on immediately — a fast, clean failure
-    is far more valuable than a slow, hidden one for a live detection
-    loop. See module docstring's "Hard timeout backstop" section.
+    No retry logic here by design: `requests` does not retry
+    automatically, unlike the OpenAI/Anthropic SDKs — so, unlike the
+    previous SDK-based implementation, there is no risk of a
+    configured timeout silently multiplying via built-in retry/backoff
+    behaviour. See module docstring's "Hard timeout backstop" section.
     """
-    from openai import OpenAI
-
     api_key = os.environ.get("NVIDIA_NIM_API_KEY")
     if not api_key:
         raise RuntimeError("NVIDIA_NIM_API_KEY is not set in the environment (.env)")
 
     nim_config = config["llm"]["nim"]
-    client = OpenAI(
-        base_url=nim_config["base_url"],
-        api_key=api_key,
-        timeout=timeout_seconds,
-        max_retries=0,
-    )
+    url = f"{nim_config['base_url'].rstrip('/')}/chat/completions"
 
-    response = client.chat.completions.create(
-        model=nim_config["model"],
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,  # Low temperature — we want consistent, deterministic-ish classification, not creative variation
-        max_tokens=300,
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": nim_config["model"],
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,  # Low temperature — consistent, deterministic-ish classification, not creative variation
+            "max_tokens": 300,
+        },
+        timeout=timeout_seconds,
     )
-    return response.choices[0].message.content
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"]
 
 
 def _call_anthropic(prompt: str, config: dict, timeout_seconds: float) -> str:
     """
-    Call the Anthropic Claude API. Raises on any failure — callers
-    are responsible for catching and converting to a graceful
-    AnalysisResult(available=False, ...).
+    Call the Anthropic Claude REST API directly. Raises on any failure
+    — callers are responsible for catching and converting to a
+    graceful AnalysisResult(available=False, ...).
 
-    max_retries=0: same reasoning as _call_nim above — the Anthropic
-    SDK also retries by default, which would multiply the configured
-    timeout unpredictably. See module docstring's "Hard timeout
-    backstop" section.
+    No retry logic here by design — same reasoning as _call_nim above.
+    See module docstring's "Hard timeout backstop" section.
     """
-    import anthropic
-
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set in the environment (.env)")
 
     anthropic_config = config["llm"]["anthropic"]
-    client = anthropic.Anthropic(
-        api_key=api_key,
-        timeout=timeout_seconds,
-        max_retries=0,
-    )
 
-    response = client.messages.create(
-        model=anthropic_config["model"],
-        max_tokens=300,
-        temperature=0.2,
-        messages=[{"role": "user", "content": prompt}],
+    response = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": anthropic_config["model"],
+            "max_tokens": 300,
+            "temperature": 0.2,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=timeout_seconds,
     )
-    return response.content[0].text
+    response.raise_for_status()
+    data = response.json()
+    return data["content"][0]["text"]
 
 
 # Single shared worker pool for the hard-timeout backstop below. One
@@ -407,13 +469,12 @@ def _run_with_hard_timeout(func, timeout_seconds: float, *args, **kwargs):
     """
     Run `func(*args, **kwargs)` in a worker thread and enforce a hard
     wall-clock deadline from the CALLING thread, regardless of
-    whether func's own internal timeout/retry logic actually fires.
+    whether func's own internal timeout logic actually fires.
 
     This is the backstop described in the module docstring: even if
-    the OpenAI/Anthropic client's own `timeout=` argument fails to
-    cut off a hung connection (a stalled proxy, a DNS resolution that
-    never completes, a future SDK version with different retry
-    defaults), the calling thread is GUARANTEED to regain control
+    `requests`' own `timeout=` argument fails to cut off a hung
+    connection (a stalled proxy, a DNS resolution that never
+    completes), the calling thread is GUARANTEED to regain control
     after timeout_seconds + a small buffer.
 
     If the deadline is exceeded, the worker thread is simply abandoned
@@ -428,17 +489,17 @@ def _run_with_hard_timeout(func, timeout_seconds: float, *args, **kwargs):
     """
     future = _llm_call_executor.submit(func, *args, **kwargs)
     try:
-        # +2s buffer: the client's own timeout is enforced internally
-        # by the SDK's HTTP layer; this outer deadline just needs to
-        # be slightly more generous so a clean internal timeout has a
+        # +2s buffer: requests' own timeout is enforced internally at
+        # the socket level; this outer deadline just needs to be
+        # slightly more generous so a clean internal timeout has a
         # chance to return normally, while still guaranteeing this
         # call can never block indefinitely.
         return future.result(timeout=timeout_seconds + 2.0)
     except FutureTimeoutError:
         raise TimeoutError(
             f"LLM call did not return within {timeout_seconds + 2.0:.1f}s "
-            "(hard backstop timeout — the SDK's own timeout/retry handling "
-            "did not return control in time)."
+            "(hard backstop timeout — the underlying HTTP call did not "
+            "return control in time)."
         )
 
 
@@ -502,9 +563,9 @@ class LLMAnalyser:
                 )
         except Exception as e:
             # Deliberately broad: ANY failure here (network error,
-            # auth error, timeout, provider outage, missing API key,
-            # or the hard backstop TimeoutError above) must degrade
-            # gracefully, not crash flow processing.
+            # HTTP error status, timeout, malformed response, missing
+            # API key, or the hard backstop TimeoutError above) must
+            # degrade gracefully, not crash flow processing.
             return AnalysisResult(available=False, error=f"{type(e).__name__}: {e}")
 
         return _parse_llm_response(raw_response)

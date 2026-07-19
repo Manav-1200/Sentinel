@@ -24,9 +24,48 @@ reduced to a practical subset we can compute cheaply in real time:
     completing the handshake).
   - Payload features distinguish "real" data exchange from bare
     control traffic (pure ACKs, scans with no payload at all).
+  - Directionality features (added July 2026) distinguish a
+    legitimate high-volume transfer from a flood — see
+    "bulk-transfer/ddos confusion fix" below.
+  - Burstiness/timing-regularity features (added July 2026)
+    distinguish uniform, script-driven timing from normal bursty
+    traffic — see "flood/DoS separability" below.
 
 None of this module decides what's an attack — it just measures. The
 anomaly detector (Phase 1.4) is what interprets these numbers.
+
+Bulk-transfer/ddos confusion fix (July 2026):
+-------------------------------------------------
+Real-world testing found the Phase 2 classifier mislabelling a
+legitimate 16,133-packet HTTPS download as "ddos" purely because
+total_packets/packets_per_second looked similar to a genuine flood.
+Root cause: the classifier's training data (LLM-labelled samples) had
+essentially no high-volume "benign" examples, because labeller.process()
+only runs on already-SUSPICIOUS/ATTACK flows, and a legitimate bulk
+transfer rarely lands in that narrow band — it's usually either NORMAL
+or gets shot straight to ATTACK by the deterministic flood-rate guard,
+so the LLM almost never got a chance to correctly call one "benign".
+Existing features (packet count, rate) genuinely cannot separate the
+two patterns on their own. `fwd_packet_share` and (in the TCP flag
+block below) `ack_ratio` give both the LLM (see
+detection/llm_analyser.py's updated prompt) and the classifier a real,
+distinguishing signal: a legitimate download is backward-heavy with a
+high ACK ratio (properly established connection); a real flood/
+syn_flood is forward-heavy with a low ACK ratio (no real handshake
+completion).
+
+Flood/DoS separability (July 2026, partial improvement):
+-------------------------------------------------------------
+config.yaml documents a known, previously-unsolved limitation: flood-
+style attacks are only weakly separable from normal bursty traffic
+using packet-rate features alone, since a normal traffic burst (page
+load, video buffering) can have a similarly high rate. The real
+missing signal is timing REGULARITY, not just rate: a script-driven
+flood fires packets at near-identical intervals (low coefficient of
+variation on inter-arrival time), while normal bursty traffic is
+irregular even at a similarly high rate. `iat_cv` (see _iat_stats)
+adds this as an explicit feature. This is a genuine improvement, not
+a full fix — see config.yaml's comment for the ongoing backlog item.
 """
 
 from __future__ import annotations
@@ -95,6 +134,37 @@ def extract(flow: Flow) -> Optional[dict]:
     features["packets_per_second"] = features["total_packets"] / duration_seconds
 
     # ------------------------------------------------------------
+    # Directional asymmetry (added July 2026) — distinguishes a
+    # legitimate download (heavily backward: server->client data,
+    # client sends only small ACKs) from a flood/DDoS (heavily
+    # forward: attacker->target, target barely responds because it's
+    # overwhelmed or doesn't complete the handshake). Packet-count/
+    # rate features alone can't tell these apart — a 16k-packet
+    # download and a 16k-packet flood can have near-identical
+    # total_packets and packets_per_second. This ratio is what
+    # actually separates them. See module docstring's
+    # "bulk-transfer/ddos confusion fix" section.
+    #
+    # Two features are kept, not one, deliberately: bwd_fwd_packet_
+    # ratio can blow up to very large or unstable values when
+    # fwd_packets is tiny, which is noisy for a tree-based model to
+    # split on cleanly. fwd_packet_share is bounded [0, 1] and gives a
+    # cleaner signal for both the Isolation Forest and the classifier
+    # — a real flood sits close to 1.0 (almost all forward, target
+    # barely answers), a real download sits closer to 0.2-0.4 (client
+    # sends far fewer, smaller ACKs back).
+    # ------------------------------------------------------------
+    total_directional = features["fwd_packets"] + features["bwd_packets"]
+    features["bwd_fwd_packet_ratio"] = (
+        features["bwd_packets"] / features["fwd_packets"]
+        if features["fwd_packets"] > 0 else 0.0
+    )
+    features["fwd_packet_share"] = (
+        features["fwd_packets"] / total_directional
+        if total_directional > 0 else 0.0
+    )
+
+    # ------------------------------------------------------------
     # Packet size statistics (forward and backward separately —
     # an attack often looks very different in one direction only,
     # e.g. a DoS flood is huge in the forward direction but the
@@ -107,7 +177,9 @@ def extract(flow: Flow) -> Optional[dict]:
     # Inter-arrival time (IAT) statistics — the gaps between
     # consecutive packets. A normal human-driven connection has
     # irregular, relatively large gaps. A scripted attack (port scan,
-    # flood) tends to have very small, very regular gaps.
+    # flood) tends to have very small, very regular gaps. See
+    # _iat_stats for the added iat_cv (coefficient of variation)
+    # feature, which specifically targets timing regularity.
     # ------------------------------------------------------------
     features.update(_iat_stats("iat", flow.packets))
 
@@ -171,11 +243,22 @@ def _size_stats(prefix: str, packets: list) -> dict:
 
 def _iat_stats(prefix: str, packets: list) -> dict:
     """
-    Compute mean/max/min/std of inter-arrival time (the time gap
+    Compute mean/max/min/std/cv of inter-arrival time (the time gap
     between consecutive packets, in seconds) across an entire flow.
 
     Packets are assumed to already be in arrival order (sniffer.py
     appends them as they arrive, so this holds true).
+
+    iat_cv (coefficient of variation = std/mean, added July 2026):
+    the real missing signal for flood/DoS separability (see module
+    docstring). A script-driven flood fires packets at near-identical
+    intervals — very low CV, often close to 0. Normal bursty traffic
+    (page loads, video buffering, parallel connections) has irregular
+    timing — meaningfully higher CV — even at a similarly high rate.
+    Raw mean/std alone don't normalise for scale, so a fast-but-steady
+    flood and a fast-but-jittery normal burst can end up with similar
+    std values despite very different underlying regularity; CV
+    captures that difference directly.
     """
     if len(packets) < 2:
         return {
@@ -183,6 +266,7 @@ def _iat_stats(prefix: str, packets: list) -> dict:
             f"{prefix}_max": 0.0,
             f"{prefix}_min": 0.0,
             f"{prefix}_std": 0.0,
+            f"{prefix}_cv": 0.0,
         }
 
     gaps = [
@@ -195,11 +279,16 @@ def _iat_stats(prefix: str, packets: list) -> dict:
     # negative number distort the statistics.
     gaps = [max(gap, 0.0) for gap in gaps]
 
+    mean_gap = statistics.mean(gaps)
+    std_gap = statistics.stdev(gaps) if len(gaps) >= 2 else 0.0
+    iat_cv = (std_gap / mean_gap) if mean_gap > 0 else 0.0
+
     return {
-        f"{prefix}_mean": statistics.mean(gaps),
+        f"{prefix}_mean": mean_gap,
         f"{prefix}_max": max(gaps),
         f"{prefix}_min": min(gaps),
-        f"{prefix}_std": statistics.stdev(gaps) if len(gaps) >= 2 else 0.0,
+        f"{prefix}_std": std_gap,
+        f"{prefix}_cv": iat_cv,
     }
 
 
@@ -244,6 +333,14 @@ def _tcp_flag_features(packets: list) -> dict:
     # sends SYN after SYN with little else.
     syn_ratio = (syn_count / tcp_packet_count) if tcp_packet_count > 0 else 0.0
 
+    # ACK ratio (added July 2026) is a strong "legitimate established
+    # connection" indicator — a normal download/upload is nearly all
+    # ACKs after the initial handshake. A SYN flood or scan has a very
+    # low ACK ratio (SYNs sent with no real handshake completion).
+    # See module docstring's "bulk-transfer/ddos confusion fix"
+    # section for why this was added.
+    ack_ratio = (ack_count / tcp_packet_count) if tcp_packet_count > 0 else 0.0
+
     return {
         "syn_count": syn_count,
         "ack_count": ack_count,
@@ -252,6 +349,7 @@ def _tcp_flag_features(packets: list) -> dict:
         "psh_count": psh_count,
         "urg_count": urg_count,
         "syn_ratio": syn_ratio,
+        "ack_ratio": ack_ratio,
     }
 
 
@@ -280,4 +378,3 @@ class FeatureExtractor:
 
     def extract(self, flow: Flow) -> Optional[dict]:
         return extract(flow)
-        
