@@ -50,6 +50,11 @@ their own `block` chain and `blocked_ips` set. This means:
 
 Safety rules enforced regardless of backend:
 ------------------------------------------------
+  - THIS HOST'S OWN IP ADDRESSES ARE NEVER BLOCKED, under any
+    circumstances, regardless of whitelist_ips or
+    block_private_ranges. See _get_local_ips() and the "self-block
+    incident" note below — this is the FIRST check applied, before
+    whitelist_ips, and cannot be disabled via config.
   - response.whitelist_ips is checked BEFORE every single block
     attempt, never bypassable by any caller.
   - Private/LAN-range IPs (RFC 1918, loopback, link-local) are never
@@ -62,6 +67,32 @@ Safety rules enforced regardless of backend:
     firewall commands — the intended safe default for development,
     matching main.py's --dry-run flag and print_banner()'s existing
     dry-run notice.
+
+Self-block incident (found and fixed, July 2026):
+--------------------------------------------------------
+A real live-testing session on Azazel produced a per-flow ATTACK
+verdict (flood-rate guard, later mislabelled "ddos" by the classifier
+— see classifier.py's schema-consistency fix for the root cause of
+the mislabel itself) for a flow whose src_ip was Azazel's OWN LAN
+address (192.168.10.67) — i.e. a large legitimate outbound transfer
+FROM this host, not an external attacker. Because
+response.block_private_ranges is true (required for Manav's
+deployment, since his whole real network is private-range address
+space), this host's own address passed every existing safety check
+and got blocked — Sentinel firewalled its own machine off from the
+network, including its own DNS/TLS traffic, for the block duration.
+
+This is a category of bug that exists independent of whether the
+underlying detection verdict was correct or not: a host should NEVER
+be able to block itself, full stop. _get_local_ips() is checked
+first, unconditionally, before any other rule — there is no config
+flag that can turn this off, the same way loopback blocking can't be
+turned on. This matters especially given Sentinel's goal of running
+correctly on any server: whoever deploys it should never need to
+remember to manually whitelist "whatever this machine's own IP
+happens to be" for safety, since that address can change (DHCP,
+redeployment, different networks) in ways a static whitelist entry
+can't track.
 """
 
 from __future__ import annotations
@@ -71,6 +102,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -83,6 +115,37 @@ logger = logging.getLogger("sentinel.blocker")
 _NFT_TABLE = "sentinel"
 _NFT_CHAIN = "block"
 _NFT_SET = "blocked_ips"
+
+
+def _get_local_ips() -> set[str]:
+    """
+    Returns every IP address currently assigned to this machine's
+    network interfaces (loopback included), used to guarantee
+    Sentinel can NEVER block its own host — see the module
+    docstring's "Self-block incident" section for the real incident
+    this was added to prevent.
+
+    Uses socket.getaddrinfo() against the local hostname, which
+    covers every address family/interface bound to it — broader and
+    more reliable than a single gethostbyname() call, which only
+    returns one address. Best-effort: if hostname resolution fails
+    for any reason, this still returns the loopback addresses (never
+    an empty set), and callers should treat a failure here as "be
+    extra cautious," not "skip the check."
+    """
+    local_ips = {"127.0.0.1", "::1"}
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None):
+            local_ips.add(info[4][0])
+    except socket.gaierror:
+        logger.warning(
+            "Could not resolve local hostname to discover this host's own IPs — "
+            "only loopback addresses are protected from self-blocking this session. "
+            "If this host has other IPs, consider adding them to response.whitelist_ips "
+            "as a backup safety net."
+        )
+    return local_ips
 
 
 @dataclass
@@ -113,6 +176,12 @@ class IPBlocker:
         self.block_duration_minutes: float = float(response_config.get("block_duration_minutes", 60))
         self.whitelist_ips: set[str] = set(response_config.get("whitelist_ips", []))
         self.block_private_ranges: bool = bool(response_config.get("block_private_ranges", False))
+
+        # This host's own IP addresses — checked FIRST, unconditionally,
+        # before whitelist_ips or any other rule. See module docstring's
+        # "Self-block incident" section. Not configurable, by design.
+        self._local_ips: set[str] = _get_local_ips()
+        logger.info("Self-block protection active for local IPs: %s", sorted(self._local_ips))
 
         self.blocks_log_path: str = config.get("storage", {}).get("blocks_log", "data/logs/blocks.log")
 
@@ -244,7 +313,16 @@ class IPBlocker:
 
     def _check_skip(self, ip: str) -> Optional[str]:
         """Returns a human-readable reason to skip blocking `ip`, or
-        None if it's safe to proceed."""
+        None if it's safe to proceed.
+
+        Check order matters: self-host protection is FIRST and is
+        never bypassable by config — see module docstring's
+        "Self-block incident" section. Everything else follows in the
+        same order as before.
+        """
+        if ip in self._local_ips:
+            return "IP belongs to this host itself — Sentinel never blocks its own machine"
+
         if ip in self.whitelist_ips:
             return "IP is in response.whitelist_ips"
 
@@ -437,4 +515,3 @@ class _NullBackend:
 
     def unblock(self, ip: str) -> None:
         raise RuntimeError("no firewall backend available (neither 'nft' nor 'iptables' found on PATH)")
-

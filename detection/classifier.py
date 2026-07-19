@@ -74,21 +74,37 @@ record-keeping, auditing, and any FUTURE dedicated aggregate-pattern
 model — but they must never be fed to THIS classifier, which is
 trained and queried exclusively on real per-flow features.
 
-Feature set note (added alongside the bulk-transfer/ddos confusion
-fix, July 2026):
+Schema-consistency check across "llm"-sourced samples (fixed July
+2026, second real incident):
 --------------------------------------------------------------------
-`_get_feature_order()` picks up whatever numeric keys exist on the
-first usable sample, so new features (e.g. ack_ratio,
-fwd_packet_share, bwd_fwd_packet_ratio, iat_cv — added to
-features/extractor.py to fix a real mislabelling of legitimate
-high-volume transfers as "ddos") are picked up automatically here,
-with no code change required in this file. The only action needed
-when features/extractor.py's schema changes is deleting any
-previously-saved classifier model (see models.model_dir in
-config.yaml) — a loaded model's stored feature_order reflects
-whatever schema existed when IT was trained/saved, not the current
-one, so an old model will keep scoring on a stale, incomplete column
-set until retrained from scratch.
+Restricting to TRAINING_LABEL_SOURCES = {"llm"} fixed the ddos_tracker/
+port_scan_tracker incompatibility above, but a second, more subtle
+version of the SAME underlying problem was found shortly after:
+features/extractor.py gained three new features (ack_ratio,
+fwd_packet_share, iat_cv) specifically to fix a real bulk-transfer/
+ddos misclassification (see that module's docstring). Every "llm"-
+sourced sample stored BEFORE that change lacks these three keys
+entirely. _get_feature_order() still derived its column order from
+whichever sample happened to be first in `usable` — with 706 stored
+samples and only a handful collected after the feature change, the
+first sample was virtually guaranteed to be an old one, meaning the
+classifier kept training WITHOUT the new features at all, silently
+defeating the fix with no error and no visible warning. This was
+caught directly: a real 68,245-packet legitimate outbound transfer
+(confirmed via live testing, July 2026) was still mislabelled "ddos"
+after the fix supposedly landed.
+
+train() now computes the most common feature-key-set (schema) across
+all usable samples and treats it as canonical, EXCLUDING any sample
+whose schema doesn't match exactly — with a loud, visible warning
+naming how many samples were excluded and why. This guarantees the
+classifier is always trained on a single, consistent, CURRENT
+feature schema, and any future features/extractor.py change will
+correctly and visibly age out old-schema samples rather than letting
+them silently win by sheer numbers. If too few current-schema samples
+remain, train() raises the same "not enough data" ValueError as the
+min_samples check always has — an honest refusal rather than a
+silently degraded model.
 """
 
 from __future__ import annotations
@@ -209,6 +225,42 @@ class AttackClassifier:
                 f"{self.min_samples} required (see config.yaml's "
                 f"detection.min_classifier_samples). Keep running Sentinel to "
                 f"accumulate more LLM-labelled data."
+            )
+
+        # Schema consistency check (added July 2026 — see module
+        # docstring's "Schema-consistency check" section for the real
+        # incident this fixes). feature_order must come from a
+        # CONSISTENT set of samples, not whichever one happens to be
+        # first — otherwise a features/extractor.py change silently
+        # gets defeated by a majority of stale-schema samples.
+        schema_counts = Counter(
+            tuple(sorted(k for k in s.features.keys() if k not in IDENTITY_FIELDS))
+            for s in usable
+        )
+        canonical_schema, canonical_count = schema_counts.most_common(1)[0]
+        stale_count = len(usable) - canonical_count
+        if stale_count > 0:
+            print(
+                f"[sentinel] WARNING: {stale_count} of {len(usable)} labelled samples "
+                f"have a DIFFERENT feature schema than the current one (most likely "
+                f"from before a features/extractor.py change) and are being EXCLUDED "
+                f"from training to avoid silently training on stale features. Only "
+                f"{canonical_count} samples match the current schema and will be used. "
+                f"If this leaves too few samples, keep running Sentinel to accumulate "
+                f"more current-schema data, or clear stale samples from the database."
+            )
+        usable = [
+            s for s in usable
+            if tuple(sorted(k for k in s.features.keys() if k not in IDENTITY_FIELDS)) == canonical_schema
+        ]
+
+        if len(usable) < self.min_samples:
+            raise ValueError(
+                f"Not enough CURRENT-SCHEMA labelled samples to train: {len(usable)} "
+                f"available after excluding {stale_count} stale-schema samples "
+                f"(see the schema-consistency warning above), {self.min_samples} "
+                f"required. Keep running Sentinel to accumulate more current-schema "
+                f"LLM-labelled data."
             )
 
         distinct_labels = {s.label for s in usable}
