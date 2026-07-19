@@ -32,6 +32,37 @@ least N distinct destination ports within the window. Requiring
 DISTINCT ports (not just flow count) avoids flagging a single source
 that legitimately opens many connections to the same one or two
 services (e.g. a busy web client).
+
+distinct_targets_in_window precision fix (July 2026):
+--------------------------------------------------------
+Real-world testing found the REPORTED distinct_targets_in_window
+count to be misleading in a real scan (confirmed live, July 2026): a
+real `nmap -sT` scan touching 773 distinct ports on ONE real target
+was reported as "773 distinct ports across 2 targets", because the
+scanning host also happened to make one unrelated, incidental DNS
+query during the same window — that single-port destination got
+counted as a second "target" even though it has nothing to do with
+the scan pattern.
+
+Important: this ONLY affected the human-readable reasoning text used
+in alerts/logs, never the actual ATTACK/SUSPICIOUS verdict — that
+threshold is, and always was, based purely on distinct_ports_in_window
+(which counts ports globally across the whole window, not per
+destination), so no detection or blocking behaviour was ever
+incorrect. But an inaccurate "targets" count in a reasoning string
+shown to a real operator is still a real precision problem worth
+fixing on its own — Sentinel's stated goal is dependable, non-
+misleading reporting, not just correct blocking decisions.
+
+Fix: distinct_targets_in_window now only counts a destination if it
+received MORE THAN ONE distinct port from that source within the
+window — i.e. it shows at least some minimal fan-out signal, rather
+than counting every incidental destination the source happened to
+touch (a single DNS lookup, one NTP request, etc.). A destination
+that received only one port is not evidence of scanning behaviour
+toward that host and is correctly excluded from the "targets" count,
+even though it's still counted correctly toward the source's overall
+flow history.
 """
 
 from __future__ import annotations
@@ -79,6 +110,15 @@ class PortScanTracker:
     current verdict for that specific source.
     """
 
+    # Minimum number of distinct ports a single destination must have
+    # received from a source before that destination counts toward
+    # distinct_targets_in_window. See module docstring's
+    # "distinct_targets_in_window precision fix" section — a
+    # destination touched on exactly one port shows no fan-out signal
+    # and is very likely incidental traffic (a DNS lookup, an NTP
+    # request), not part of whatever scan pattern triggered detection.
+    MIN_PORTS_PER_TARGET_TO_COUNT = 2
+
     def __init__(self, config: dict):
         port_scan_config = config.get("port_scan", {})
 
@@ -114,6 +154,17 @@ class PortScanTracker:
         Compute the current port-scan verdict for src_ip, based on
         distinct destination ports touched within the sliding window
         ending at current_timestamp.
+
+        distinct_ports_in_window (drives the actual verdict) counts
+        every distinct port touched anywhere in the window, exactly
+        as before — this is unchanged and is not affected by the fix
+        below.
+
+        distinct_targets_in_window (reporting only, see module
+        docstring) now counts only destinations that received more
+        than MIN_PORTS_PER_TARGET_TO_COUNT-1 distinct ports from this
+        source — i.e. destinations that show actual fan-out, not
+        every incidental destination touched during the window.
         """
         with self._lock:
             entries = self._recent_by_source.get(src_ip)
@@ -128,7 +179,14 @@ class PortScanTracker:
 
             self._evict_old_entries(entries, current_timestamp)
             distinct_ports = len({dst_port for _, _, dst_port in entries})
-            distinct_targets = len({dst_ip for _, dst_ip, _ in entries})
+
+            ports_per_target: dict[str, set[int]] = defaultdict(set)
+            for _, dst_ip, dst_port in entries:
+                ports_per_target[dst_ip].add(dst_port)
+            distinct_targets = sum(
+                1 for ports in ports_per_target.values()
+                if len(ports) >= self.MIN_PORTS_PER_TARGET_TO_COUNT
+            )
 
         if distinct_ports >= self.attack_distinct_ports_threshold:
             verdict = PortScanVerdict.ATTACK
