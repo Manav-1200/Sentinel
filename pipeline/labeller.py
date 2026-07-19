@@ -96,6 +96,14 @@ Per-source port-scan samples (process_port_scan_attack):
   per source IP across many flows, not tied to any single flow — see
   main.py for where this is invoked, on the transition into an
   ATTACK-level port-scan verdict for a given source IP.
+
+  Reasoning text grammar fix (July 2026): the human-readable
+  reasoning string previously always said "N targets", even when
+  N was 1 (e.g. "touched 692 distinct ports across 1 targets"). This
+  never affected detection or blocking — purely a cosmetic accuracy
+  issue in text shown to a real operator — but Sentinel's stated goal
+  is precise, non-confusing reporting, so the singular/plural form is
+  now chosen correctly based on the actual count.
 """
 
 from __future__ import annotations
@@ -300,6 +308,10 @@ class Labeller:
         is stored instead of real per-flow features. anomaly_score is
         None, matching how aggregate DDoS samples are stored — there
         is no Isolation Forest score for this kind of finding.
+
+        Grammar note (July 2026): the reasoning text below correctly
+        pluralises "target"/"targets" based on the actual count —
+        see module docstring's "Reasoning text grammar fix" section.
         """
         features = {
             "detection_type": "port_scan",
@@ -309,10 +321,11 @@ class Labeller:
             "distinct_targets_in_window": port_scan_result.distinct_targets_in_window,
         }
         synthetic_result = DetectionResult(Verdict.ATTACK, None, features)
+        target_word = "target" if port_scan_result.distinct_targets_in_window == 1 else "targets"
         reasoning = (
             f"Port scan tracker: source {port_scan_result.src_ip} touched "
             f"{port_scan_result.distinct_ports_in_window} distinct destination ports "
-            f"across {port_scan_result.distinct_targets_in_window} targets within a "
+            f"across {port_scan_result.distinct_targets_in_window} {target_word} within a "
             f"{port_scan_result.window_seconds:.0f}s window (threshold exceeded)."
         )
         return self._store(
