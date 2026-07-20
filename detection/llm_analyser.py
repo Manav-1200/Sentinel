@@ -80,18 +80,44 @@ features/extractor.py's module docstring for the full feature
 rationale) and gives the LLM concrete guidance on how to use them,
 so it can correctly label high-volume-but-legitimate traffic as
 "benign" instead of defaulting to a volume-based guess.
+
+Rate-limit retry queue (added July 2026):
+--------------------------------------------
+Real DB inspection (July 20, 2026) showed 257 flows stored as
+label="unknown", source="llm_failed" — the overwhelming majority
+(204 in a single hour) due to `Rate limit exceeded` being hit during
+a traffic burst that exceeded max_calls_per_minute. Previously, a
+rate-limited flow's analysis was simply discarded forever: a real
+shot at a labelled training example, thrown away because it happened
+to land in a busy 60-second window rather than because anything was
+actually wrong with it.
+
+analyse() still NEVER blocks the calling capture loop waiting for
+rate-limit capacity to free up — that guarantee from the module
+docstring's "Hard timeout backstop" section is unchanged. Instead,
+when the rate limiter blocks a call, the flow's features are pushed
+onto a small bounded in-memory queue (LLMAnalyser.pending_retries)
+and a lightweight background daemon thread opportunistically drains
+it — respecting the exact same rate limiter, so a retried call can
+never itself cause a fresh burst of throttling — calling a
+caller-supplied store callback with the eventual AnalysisResult. The
+queue is intentionally bounded (see _MAX_PENDING_RETRIES) so an
+extreme, sustained burst still degrades gracefully back to the old
+"drop and log as llm_failed" behaviour rather than growing without
+limit and consuming unbounded memory.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
@@ -144,6 +170,22 @@ class AnalysisResult:
         )
 
 
+@dataclass
+class _PendingRetry:
+    """
+    A rate-limited flow's data, held onto just long enough for the
+    background retry worker to try again once capacity frees up.
+    Stores everything analyse() needs to re-run the call, plus the
+    caller-supplied callback to invoke once a real result (success or
+    a genuine, non-rate-limit failure) is available.
+    """
+    features: dict
+    anomaly_score: float
+    verdict: str
+    on_result: Callable[["AnalysisResult"], None]
+    enqueued_at: float = field(default_factory=time.time)
+
+
 # ----------------------------------------------------------------------
 # Rate limiting
 # ----------------------------------------------------------------------
@@ -162,18 +204,20 @@ class _RateLimiter:
     def __init__(self, max_calls_per_minute: int):
         self.max_calls_per_minute = max_calls_per_minute
         self._call_times: deque[float] = deque()
+        self._lock = threading.Lock()
 
     def allow_call(self) -> bool:
-        now = time.time()
-        cutoff = now - 60.0
-        while self._call_times and self._call_times[0] < cutoff:
-            self._call_times.popleft()
+        with self._lock:
+            now = time.time()
+            cutoff = now - 60.0
+            while self._call_times and self._call_times[0] < cutoff:
+                self._call_times.popleft()
 
-        if len(self._call_times) >= self.max_calls_per_minute:
-            return False
+            if len(self._call_times) >= self.max_calls_per_minute:
+                return False
 
-        self._call_times.append(now)
-        return True
+            self._call_times.append(now)
+            return True
 
 
 # ----------------------------------------------------------------------
@@ -503,9 +547,21 @@ def _run_with_hard_timeout(func, timeout_seconds: float, *args, **kwargs):
         )
 
 
-# ----------------------------------------------------------------------
-# Public API
-# ----------------------------------------------------------------------
+# Bound on the rate-limit retry queue (see module docstring's
+# "Rate-limit retry queue" section). Sized generously above the
+# largest observed real burst (204 drops in one hour, July 9 2026)
+# while still being a genuine bound — an attacker deliberately trying
+# to exhaust memory via a sustained flood would eventually hit this
+# cap and fall back to the old "drop and log as llm_failed" behaviour,
+# rather than growing the queue without limit.
+_MAX_PENDING_RETRIES = 500
+
+# How often the background retry worker wakes up to check whether the
+# rate limiter has freed up capacity. Short enough that a retried flow
+# is picked up promptly once capacity exists, long enough not to spin.
+_RETRY_POLL_INTERVAL_SECONDS = 2.0
+
+
 class LLMAnalyser:
     """
     Provider-agnostic LLM flow analyser. Construct once, call
@@ -525,6 +581,14 @@ class LLMAnalyser:
         if self.provider not in ("nim", "anthropic"):
             raise ValueError(f"Unknown llm.provider: {self.provider!r}. Expected 'nim' or 'anthropic'.")
 
+        # Rate-limit retry queue (see module docstring). Guarded by a
+        # lock since the main thread (analyse()) enqueues while the
+        # background worker thread dequeues.
+        self._pending_retries: deque[_PendingRetry] = deque()
+        self._pending_lock = threading.Lock()
+        self._retry_worker_thread: Optional[threading.Thread] = None
+        self._stop_retry_worker = threading.Event()
+
     def should_analyse(self, anomaly_score: float) -> bool:
         """
         Whether a flow with this anomaly score should be sent to the
@@ -534,24 +598,80 @@ class LLMAnalyser:
         """
         return anomaly_score < self.min_score_for_analysis
 
-    def analyse(self, features: dict, anomaly_score: float, verdict: str) -> AnalysisResult:
+    def start_retry_worker(self) -> None:
         """
-        Ask the configured LLM provider to reason about a flow.
-        Returns AnalysisResult(available=False, ...) gracefully for
-        ANY failure — rate limit exceeded, network error, timeout,
-        malformed response — rather than raising. This method must
-        never crash the calling pipeline, and — as of the hard
-        timeout backstop described in the module docstring — must
-        never block it for longer than timeout_seconds + 2s either.
+        Start the background daemon thread that drains the rate-limit
+        retry queue. Safe to call once at startup (e.g. from
+        main.py's build_response_stack()-style wiring); a no-op if
+        already running. The thread is a daemon so it never blocks
+        process shutdown.
         """
-        if not self._rate_limiter.allow_call():
-            return AnalysisResult(
-                available=False,
-                error="Rate limit exceeded (max_calls_per_minute) — skipping LLM analysis for this flow.",
+        if self._retry_worker_thread is not None and self._retry_worker_thread.is_alive():
+            return
+        self._stop_retry_worker.clear()
+        self._retry_worker_thread = threading.Thread(
+            target=self._retry_worker_loop, name="llm-analyser-retry-worker", daemon=True
+        )
+        self._retry_worker_thread.start()
+
+    def stop_retry_worker(self) -> None:
+        """Signal the retry worker thread to stop (used on shutdown)."""
+        self._stop_retry_worker.set()
+
+    def _retry_worker_loop(self) -> None:
+        """
+        Background loop: periodically checks whether rate-limit
+        capacity is available, and if so, pops the oldest pending
+        retry and attempts it for real. Deliberately processes at most
+        one retry per wake-up — the same rate limiter instance used by
+        analyse() is shared here, so a retried call counts against the
+        exact same budget as a live call, and can never itself trigger
+        a fresh burst of throttling.
+        """
+        while not self._stop_retry_worker.is_set():
+            self._stop_retry_worker.wait(_RETRY_POLL_INTERVAL_SECONDS)
+
+            with self._pending_lock:
+                if not self._pending_retries:
+                    continue
+                if not self._rate_limiter.allow_call():
+                    continue
+                pending = self._pending_retries.popleft()
+
+            result = self._call_llm(pending.features, pending.anomaly_score, pending.verdict)
+            pending.on_result(result)
+
+    def _enqueue_retry(
+        self,
+        features: dict,
+        anomaly_score: float,
+        verdict: str,
+        on_result: Callable[["AnalysisResult"], None],
+    ) -> bool:
+        """
+        Attempt to enqueue a rate-limited flow for a later retry.
+        Returns False (queue full, caller should fall back to the old
+        drop-and-log behaviour) if _MAX_PENDING_RETRIES is already
+        reached — see that constant's comment for why this bound
+        exists.
+        """
+        with self._pending_lock:
+            if len(self._pending_retries) >= _MAX_PENDING_RETRIES:
+                return False
+            self._pending_retries.append(
+                _PendingRetry(features=features, anomaly_score=anomaly_score, verdict=verdict, on_result=on_result)
             )
+            return True
 
+    def _call_llm(self, features: dict, anomaly_score: float, verdict: str) -> "AnalysisResult":
+        """
+        The actual provider call + parsing, with no rate-limit check —
+        shared by analyse() (which has already checked the rate
+        limiter) and the retry worker (which checks it separately
+        under its own lock). Never raises; degrades to
+        AnalysisResult(available=False, ...) on any failure.
+        """
         prompt = _build_prompt(features, anomaly_score, verdict)
-
         try:
             if self.provider == "nim":
                 raw_response = _run_with_hard_timeout(
@@ -569,3 +689,44 @@ class LLMAnalyser:
             return AnalysisResult(available=False, error=f"{type(e).__name__}: {e}")
 
         return _parse_llm_response(raw_response)
+
+    def analyse(
+        self,
+        features: dict,
+        anomaly_score: float,
+        verdict: str,
+        on_retry_result: Optional[Callable[["AnalysisResult"], None]] = None,
+    ) -> AnalysisResult:
+        """
+        Ask the configured LLM provider to reason about a flow.
+        Returns AnalysisResult(available=False, ...) gracefully for
+        ANY failure — rate limit exceeded, network error, timeout,
+        malformed response — rather than raising. This method must
+        never crash the calling pipeline, and — as of the hard
+        timeout backstop described in the module docstring — must
+        never block it for longer than timeout_seconds + 2s either.
+
+        Rate-limit retry (see module docstring's "Rate-limit retry
+        queue" section): if the rate limiter blocks this call AND the
+        caller passed on_retry_result, the flow is queued for a later
+        retry instead of being dropped — on_retry_result will be
+        invoked later, from the background retry worker thread (NOT
+        from this call), once a real result is available. Callers
+        that care about capturing these delayed results (e.g. the
+        Labeller, to still store a proper llm-sourced label instead of
+        llm_failed) should pass a thread-safe callback; callers that
+        don't pass on_retry_result get the old behaviour exactly —
+        an immediate AnalysisResult(available=False, ...).
+        """
+        if not self._rate_limiter.allow_call():
+            if on_retry_result is not None and self._enqueue_retry(features, anomaly_score, verdict, on_retry_result):
+                return AnalysisResult(
+                    available=False,
+                    error="Rate limit exceeded (max_calls_per_minute) — queued for retry.",
+                )
+            return AnalysisResult(
+                available=False,
+                error="Rate limit exceeded (max_calls_per_minute) — skipping LLM analysis for this flow.",
+            )
+
+        return self._call_llm(features, anomaly_score, verdict)
