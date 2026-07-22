@@ -105,6 +105,20 @@ class TestDryRun:
 # ------------------------------------------------------------
 
 class TestSafetyChecks:
+    # _get_local_ips() calls real socket.getaddrinfo() against this
+    # machine's actual hostname — on Azazel that genuinely resolves to
+    # 192.168.10.67 (see response/blocker.py's "Self-block incident"
+    # docstring), which collides with several tests below that use
+    # 192.168.10.67 purely as a generic "some private LAN IP" fixture.
+    # Without this patch, those tests pass or fail depending on which
+    # machine/network runs them rather than on the actual logic being
+    # tested. Pinning _get_local_ips() to a fixed, unrelated set makes
+    # this class deterministic regardless of environment.
+    @pytest.fixture(autouse=True)
+    def _fixed_local_ips(self):
+        with patch("response.blocker._get_local_ips", return_value={"127.0.0.1", "::1"}):
+            yield
+
     def test_whitelisted_ip_never_blocked(self, tmp_path):
         with patch("response.blocker.shutil.which", return_value="/usr/bin/nft"), \
              patch("response.blocker.subprocess.run", side_effect=fake_subprocess_run_success) as mock_run:

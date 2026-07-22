@@ -54,15 +54,34 @@ shown to a real operator is still a real precision problem worth
 fixing on its own — Sentinel's stated goal is dependable, non-
 misleading reporting, not just correct blocking decisions.
 
-Fix: distinct_targets_in_window now only counts a destination if it
-received MORE THAN ONE distinct port from that source within the
-window — i.e. it shows at least some minimal fan-out signal, rather
-than counting every incidental destination the source happened to
-touch (a single DNS lookup, one NTP request, etc.). A destination
-that received only one port is not evidence of scanning behaviour
-toward that host and is correctly excluded from the "targets" count,
-even though it's still counted correctly toward the source's overall
-flow history.
+First attempt (found to be too narrow, July 2026): counted a
+destination as a "target" only if it received MORE THAN ONE distinct
+port from that source within the window (vertical fan-out). This
+correctly excluded incidental single-port destinations (a DNS lookup,
+an NTP request) — but it also excluded a real, different scan shape:
+a HORIZONTAL scan, where a source probes the SAME single port across
+MANY different destination IPs (e.g. hunting for one specific open
+service across a subnet). In that pattern every individual
+destination legitimately receives only one port each, so the
+vertical-fan-out-only rule incorrectly reported 0 targets even though
+10 distinct hosts were genuinely being scanned.
+
+Fix: a destination now counts as a "target" if it shows fan-out in
+EITHER direction:
+  - Vertical: it received at least MIN_PORTS_PER_TARGET_TO_COUNT
+    distinct ports from this source (the original July fix, still
+    correctly excludes an isolated single-port destination on its
+    own), OR
+  - Horizontal: at least one of the ports it received was ALSO seen,
+    from this same source, on at least MIN_TARGETS_PER_PORT_TO_COUNT
+    other distinct destinations within the window (i.e. this exact
+    port is being probed broadly, not just against this one host).
+
+A single incidental destination (one port, and that port touched
+nowhere else in the window) still correctly counts as 0 -- neither
+condition is met. A same-port sweep across many hosts now correctly
+counts every one of those hosts as a target, since the horizontal
+condition is met for all of them.
 """
 
 from __future__ import annotations
@@ -112,12 +131,18 @@ class PortScanTracker:
 
     # Minimum number of distinct ports a single destination must have
     # received from a source before that destination counts toward
-    # distinct_targets_in_window. See module docstring's
-    # "distinct_targets_in_window precision fix" section — a
-    # destination touched on exactly one port shows no fan-out signal
-    # and is very likely incidental traffic (a DNS lookup, an NTP
-    # request), not part of whatever scan pattern triggered detection.
+    # distinct_targets_in_window via VERTICAL fan-out (many ports, one
+    # host). See module docstring's "distinct_targets_in_window
+    # precision fix" section.
     MIN_PORTS_PER_TARGET_TO_COUNT = 2
+
+    # Minimum number of distinct destinations a single port must have
+    # been touched on (by the same source) before that port counts as
+    # HORIZONTAL fan-out (one port, many hosts) — see module
+    # docstring's "Fix" section. A destination that only received a
+    # port also seen on this many-or-more OTHER destinations counts as
+    # a target even though it individually received just one port.
+    MIN_TARGETS_PER_PORT_TO_COUNT = 2
 
     def __init__(self, config: dict):
         port_scan_config = config.get("port_scan", {})
@@ -161,10 +186,12 @@ class PortScanTracker:
         below.
 
         distinct_targets_in_window (reporting only, see module
-        docstring) now counts only destinations that received more
-        than MIN_PORTS_PER_TARGET_TO_COUNT-1 distinct ports from this
-        source — i.e. destinations that show actual fan-out, not
-        every incidental destination touched during the window.
+        docstring) counts a destination as a target if it shows scan
+        fan-out in EITHER direction: vertical (>=
+        MIN_PORTS_PER_TARGET_TO_COUNT distinct ports on that one
+        destination) or horizontal (at least one of its ports was also
+        touched, by this source, on >= MIN_TARGETS_PER_PORT_TO_COUNT
+        other distinct destinations in the window).
         """
         with self._lock:
             entries = self._recent_by_source.get(src_ip)
@@ -181,12 +208,19 @@ class PortScanTracker:
             distinct_ports = len({dst_port for _, _, dst_port in entries})
 
             ports_per_target: dict[str, set[int]] = defaultdict(set)
+            targets_per_port: dict[int, set[str]] = defaultdict(set)
             for _, dst_ip, dst_port in entries:
                 ports_per_target[dst_ip].add(dst_port)
-            distinct_targets = sum(
-                1 for ports in ports_per_target.values()
-                if len(ports) >= self.MIN_PORTS_PER_TARGET_TO_COUNT
-            )
+                targets_per_port[dst_port].add(dst_ip)
+
+            distinct_targets = 0
+            for dst_ip, ports in ports_per_target.items():
+                vertical = len(ports) >= self.MIN_PORTS_PER_TARGET_TO_COUNT
+                horizontal = any(
+                    len(targets_per_port[p]) >= self.MIN_TARGETS_PER_PORT_TO_COUNT for p in ports
+                )
+                if vertical or horizontal:
+                    distinct_targets += 1
 
         if distinct_ports >= self.attack_distinct_ports_threshold:
             verdict = PortScanVerdict.ATTACK
