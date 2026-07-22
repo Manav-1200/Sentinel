@@ -93,6 +93,17 @@ remember to manually whitelist "whatever this machine's own IP
 happens to be" for safety, since that address can change (DHCP,
 redeployment, different networks) in ways a static whitelist entry
 can't track.
+
+Loopback vs. self-host reason messages (fixed July 2026):
+--------------------------------------------------------------
+Both loopback addresses AND this host's other real interface
+addresses are always in _local_ips (loopback is added unconditionally
+in _get_local_ips(), see below) -- but _check_skip() now checks
+addr.is_loopback FIRST, before the general _local_ips membership
+check, purely so the returned reason string is accurate ("loopback
+address, never blocked" vs. "belongs to this host itself"). This is a
+messaging fix only: loopback was always unblockable either way, since
+it's always a member of _local_ips regardless of check order.
 """
 
 from __future__ import annotations
@@ -315,24 +326,35 @@ class IPBlocker:
         """Returns a human-readable reason to skip blocking `ip`, or
         None if it's safe to proceed.
 
-        Check order matters: self-host protection is FIRST and is
+        Check order matters: self-host protection is effectively
+        first (loopback is a special case of it, checked separately
+        below only for a clearer message — see module docstring's
+        "Loopback vs. self-host reason messages" section) and is
         never bypassable by config — see module docstring's
         "Self-block incident" section. Everything else follows in the
         same order as before.
         """
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            addr = None
+
+        # Loopback is checked first, purely for message clarity. It's
+        # always also a member of self._local_ips (added
+        # unconditionally in _get_local_ips()), so this changes
+        # nothing about WHETHER loopback is blocked — it never is,
+        # either way — only the human-readable reason returned.
+        if addr is not None and addr.is_loopback:
+            return "loopback address, never blocked"
+
         if ip in self._local_ips:
             return "IP belongs to this host itself — Sentinel never blocks its own machine"
 
         if ip in self.whitelist_ips:
             return "IP is in response.whitelist_ips"
 
-        try:
-            addr = ipaddress.ip_address(ip)
-        except ValueError:
+        if addr is None:
             return f"'{ip}' is not a valid IP address"
-
-        if addr.is_loopback:
-            return "loopback address, never blocked"
 
         if (addr.is_private or addr.is_link_local) and not self.block_private_ranges:
             return "private/LAN address and response.block_private_ranges is false"

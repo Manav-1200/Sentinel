@@ -249,7 +249,18 @@ llm:
   # Maximum LLM calls allowed per minute — protects against burning
   # through free-tier rate limits during a real attack (when many
   # flows might be flagged in a short window) or during testing.
-  max_calls_per_minute: 20
+  #
+  # Raised from 20 -> 35 (July 2026): DB inspection showed 257 flows
+  # stored as label="unknown", source="llm_failed", the large
+  # majority (204 in a single hour on 2026-07-09) due to hitting this
+  # limit during a traffic burst. NVIDIA NIM's actual free-tier
+  # baseline is ~40 requests/minute (community-confirmed by NVIDIA
+  # staff, not a published SLA) -- 35 leaves a small safety margin
+  # under that real ceiling while roughly doubling prior throughput.
+  # See detection/llm_analyser.py's "Rate-limit retry queue" section
+  # for the complementary fix that queues/retries calls blocked by
+  # this limit instead of dropping them outright.
+  max_calls_per_minute: 35
 
   # Request timeout in seconds — if the LLM provider doesn't respond
   # in time, Sentinel falls back to the anomaly detector's own verdict
@@ -279,10 +290,3 @@ dashboard:
 
   # How many recent flows to return from /api/flows/recent.
   recent_flows_limit: 100
-
-  ddos:
-  window_seconds: 10.0
-  attack_total_flows_threshold: 500
-  attack_distinct_sources_threshold: 20
-  suspicious_total_flows_threshold: 200
-  suspicious_distinct_sources_threshold: 10
