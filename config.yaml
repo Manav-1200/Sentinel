@@ -124,6 +124,37 @@ ddos:
   suspicious_distinct_sources_threshold: 10
 
 # ------------------------------------------------------------
+# Brute-force / credential-stuffing detection settings
+# ------------------------------------------------------------
+# Per-(src_ip, dst_ip, dst_port) sliding-window connection-attempt
+# tracker for auth-related services (SSH, RDP, FTP, etc.). Mirrors
+# the port_scan tracker's approach: deterministic, rule-based, no LLM
+# confirmation needed. See detection/brute_force_tracker.py for the
+# full detection logic and its documented "known limitations" —
+# Sentinel can only proxy "failed login" via connection rate, never
+# an actual auth outcome, since payloads are never inspected.
+brute_force:
+  # How far back (in seconds) to look when computing attempt rate.
+  window_seconds: 60
+
+  # Attempt counts within window_seconds to flag SUSPICIOUS / ATTACK.
+  suspicious_threshold: 5
+  attack_threshold: 15
+
+  # Destination ports treated as auth-related services worth
+  # watching. Add/remove based on what you actually run — leaving an
+  # unused service in this list is harmless (no traffic ever hits
+  # it), but watching a port you DO run for something unrelated to
+  # remote auth may produce noise.
+  watched_ports:
+    - 22    # SSH
+    - 3389  # RDP
+    - 21    # FTP
+    - 23    # Telnet
+    - 3306  # MySQL
+    - 5432  # PostgreSQL
+
+# ------------------------------------------------------------
 # Response settings
 # ------------------------------------------------------------
 response:
@@ -136,6 +167,17 @@ response:
   # TEMPORARY: set to 1 for expiry testing — bump back to a real
   # duration (e.g. 60) once you're done watching blocks expire.
   block_duration_minutes: 1
+
+  # Repeat-offender escalation: a source that crosses the ATTACK
+  # threshold again after a previous block gets THIS duration instead
+  # of block_duration_minutes, up to escalation_max_multiplier times
+  # the base duration. Currently consumed by response/blocker.py's
+  # block() `duration_minutes` override, driven by each tracker's
+  # `repeat_offender_count` (see brute_force_tracker.py /
+  # port_scan_tracker.py) — a first-time offender gets the standard
+  # duration; a repeat offender gets progressively longer blocks.
+  escalation_multiplier: 3
+  escalation_max_multiplier: 10
 
   # IPs that will NEVER be blocked regardless of score.
   # Always include your router gateway and any trusted machines.
