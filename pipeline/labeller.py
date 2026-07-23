@@ -150,7 +150,7 @@ class LabelledSample:
     id: int
     timestamp: str
     label: str
-    label_source: str  # "llm", "llm_failed", "auto", "ddos_tracker", or "port_scan_tracker"
+    label_source: str  # "llm", "llm_failed", "auto", "ddos_tracker", "port_scan_tracker", or "brute_force_tracker"
     confidence: str
     anomaly_score: Optional[float]
     verdict: str
@@ -163,9 +163,11 @@ class Labeller:
     Wires together anomaly detection results, the LLM analyser, and
     SQLite storage. Call `process(result)` once per flow that the
     anomaly detector has already scored, `process_ddos_attack()` on
-    the transition into an aggregate DDoS ATTACK verdict, and
+    the transition into an aggregate DDoS ATTACK verdict,
     `process_port_scan_attack()` on the transition into a per-source
-    port-scan ATTACK verdict.
+    port-scan ATTACK verdict, and `process_brute_force_attack()` on
+    the transition into a per-(src_ip, dst_ip, dst_port) brute-force
+    ATTACK verdict.
     """
 
     def __init__(self, config: dict, llm_analyser: Optional[LLMAnalyser] = None):
@@ -333,6 +335,68 @@ class Labeller:
             effective_verdict=Verdict.ATTACK,
             label="port_scan",
             source="port_scan_tracker",
+            confidence="high",
+            reasoning=reasoning,
+        )
+
+    def process_brute_force_attack(self, brute_force_result) -> LabelledSample:
+        """
+        Store a genuine brute-force detection (see
+        detection/brute_force_tracker.py's BruteForceTracker) as a
+        labelled training sample.
+
+        Like process_ddos_attack and process_port_scan_attack, a
+        brute-force ATTACK verdict is already deterministic, rule-based
+        evidence — the (src_ip, dst_ip, dst_port) triple's
+        connection-attempt count within the sliding window crossed
+        attack_threshold (see BruteForceTracker.check() for the exact
+        rule). No LLM confirmation is requested here, for the same
+        reason the other two aggregate/per-source trackers skip it.
+
+        Callers (see main.py) should call this ONCE per transition
+        into an ATTACK-level brute-force verdict for a given
+        (src_ip, dst_ip, dst_port) triple, not on every flow processed
+        while the attempt sequence is ongoing — this method itself
+        doesn't de-duplicate, since it has no visibility into prior
+        calls (mirrors process_ddos_attack/process_port_scan_attack's
+        contract).
+
+        There is no single underlying flow for this aggregate,
+        per-triple pattern, so a synthetic feature dict describing the
+        pattern (source/dest IPs, dest port, window size, attempt
+        count) is stored instead of real per-flow features.
+        anomaly_score is None, matching how the other two trackers'
+        samples are stored — there is no Isolation Forest score for
+        this kind of finding.
+
+        Honesty note (see brute_force_tracker.py's module docstring):
+        this label reflects a connection-RATE pattern only — Sentinel
+        never confirms an actual authentication failure, since
+        payloads are never inspected. The reasoning text below is
+        phrased to reflect that (an attempt count, not a confirmed
+        failed-login count).
+        """
+        features = {
+            "detection_type": "brute_force",
+            "src_ip": brute_force_result.src_ip,
+            "dst_ip": brute_force_result.dst_ip,
+            "dst_port": brute_force_result.dst_port,
+            "window_seconds": brute_force_result.window_seconds,
+            "attempts_in_window": brute_force_result.attempts_in_window,
+        }
+        synthetic_result = DetectionResult(Verdict.ATTACK, None, features)
+        reasoning = (
+            f"Brute-force tracker: source {brute_force_result.src_ip} made "
+            f"{brute_force_result.attempts_in_window} connection attempts to "
+            f"{brute_force_result.dst_ip}:{brute_force_result.dst_port} within a "
+            f"{brute_force_result.window_seconds:.0f}s window (threshold exceeded). "
+            f"Note: reflects connection rate only, not a confirmed authentication failure."
+        )
+        return self._store(
+            synthetic_result,
+            effective_verdict=Verdict.ATTACK,
+            label="brute_force",
+            source="brute_force_tracker",
             confidence="high",
             reasoning=reasoning,
         )

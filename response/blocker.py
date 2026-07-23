@@ -188,6 +188,20 @@ class IPBlocker:
         self.whitelist_ips: set[str] = set(response_config.get("whitelist_ips", []))
         self.block_private_ranges: bool = bool(response_config.get("block_private_ranges", False))
 
+        # Escalating block duration for repeat offenders. Consumed by
+        # block()'s `repeat_offender_count` argument — a first-time
+        # offender (count <= 1) gets block_duration_minutes unchanged;
+        # each subsequent offence scales the duration by
+        # escalation_multiplier, capped at escalation_max_multiplier x
+        # the base duration, so a persistent attacker gets
+        # progressively longer blocks without an unbounded runaway
+        # duration. Callers (brute_force_tracker, port_scan_tracker)
+        # already track repeat_offender_count per source — this is
+        # just what turns that count into an actual block-duration
+        # decision.
+        self.escalation_multiplier: float = float(response_config.get("escalation_multiplier", 3))
+        self.escalation_max_multiplier: float = float(response_config.get("escalation_max_multiplier", 10))
+
         # This host's own IP addresses — checked FIRST, unconditionally,
         # before whitelist_ips or any other rule. See module docstring's
         # "Self-block incident" section. Not configurable, by design.
@@ -221,12 +235,23 @@ class IPBlocker:
         if not self.dry_run:
             self._backend.setup()
 
-    def block(self, ip: str, reason: str = "") -> BlockResult:
+    def block(self, ip: str, reason: str = "", repeat_offender_count: int = 0) -> BlockResult:
         """
-        Block `ip` for response.block_duration_minutes. Safe to call
-        repeatedly for the same IP (e.g. a scanner still active past
-        its first block) — this simply refreshes/extends the existing
-        block rather than erroring or creating a duplicate rule.
+        Block `ip` for an escalating duration based on
+        `repeat_offender_count` (see __init__'s escalation_multiplier/
+        escalation_max_multiplier). Safe to call repeatedly for the
+        same IP (e.g. a scanner still active past its first block) —
+        this simply refreshes/extends the existing block rather than
+        erroring or creating a duplicate rule.
+
+        `repeat_offender_count` defaults to 0 (meaning: use the plain
+        base block_duration_minutes, unmodified) so every EXISTING
+        caller — anomaly-detector ATTACK, DDoS ATTACK — keeps working
+        unchanged without passing this argument at all. Callers that
+        track repeat offences themselves (BruteForceTracker,
+        PortScanTracker) can pass their own
+        `get_repeat_offender_count()`-equivalent value to get
+        escalating durations.
 
         Never raises. A firewall-level failure (backend command
         errored, no backend available at all) is logged and returned
@@ -239,12 +264,13 @@ class IPBlocker:
             logger.info("Not blocking %s: %s", ip, skip_reason)
             return BlockResult(ip=ip, action="block", applied=False, reason=skip_reason, dry_run=self.dry_run)
 
-        expiry = time.time() + (self.block_duration_minutes * 60)
+        effective_duration_minutes = self._effective_duration_minutes(repeat_offender_count)
+        expiry = time.time() + (effective_duration_minutes * 60)
 
         if self.dry_run:
             logger.info(
-                "[DRY RUN] Would block %s for %.0f minutes. Reason: %s",
-                ip, self.block_duration_minutes, reason or "n/a",
+                "[DRY RUN] Would block %s for %.0f minutes (repeat_offender_count=%d). Reason: %s",
+                ip, effective_duration_minutes, repeat_offender_count, reason or "n/a",
             )
             with self._lock:
                 self._blocked_until[ip] = expiry
@@ -252,16 +278,44 @@ class IPBlocker:
             return BlockResult(ip=ip, action="block", applied=False, dry_run=True)
 
         try:
-            self._backend.block(ip, self.block_duration_minutes)
+            self._backend.block(ip, effective_duration_minutes)
         except Exception as e:
             logger.error("Failed to block %s via %s: %s", ip, self._backend.name, e)
             return BlockResult(ip=ip, action="block", applied=False, reason=str(e))
 
         with self._lock:
             self._blocked_until[ip] = expiry
-        logger.warning("Blocked %s for %.0f minutes. Reason: %s", ip, self.block_duration_minutes, reason or "n/a")
+        logger.warning(
+            "Blocked %s for %.0f minutes (repeat_offender_count=%d). Reason: %s",
+            ip, effective_duration_minutes, repeat_offender_count, reason or "n/a",
+        )
         self._log_action("block", ip, reason, dry_run=False)
         return BlockResult(ip=ip, action="block", applied=True)
+
+    def _effective_duration_minutes(self, repeat_offender_count: int) -> float:
+        """
+        Turns a repeat-offender count into an actual block duration.
+
+        count <= 1 (first offence, or a caller that doesn't track
+        this at all): base duration, unchanged.
+        count >= 2: base duration scaled by escalation_multiplier per
+        additional offence beyond the first, capped at
+        escalation_max_multiplier x base — e.g. with the default
+        multiplier=3/max=10: 2nd offence = 3x, 3rd = 6x, 4th = 9x,
+        5th+ = capped at 10x. Capping matters here specifically —
+        without it, a source with a very high repeat_offender_count
+        (a sustained, long-running attacker) could compute a block
+        duration of days or weeks, which is operationally the same as
+        a permanent ban but without ever being reviewed as one.
+        """
+        if repeat_offender_count <= 1:
+            return self.block_duration_minutes
+
+        multiplier = min(
+            self.escalation_multiplier * (repeat_offender_count - 1),
+            self.escalation_max_multiplier,
+        )
+        return self.block_duration_minutes * multiplier
 
     def unblock(self, ip: str) -> BlockResult:
         """

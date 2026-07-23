@@ -127,15 +127,17 @@ def build_response_stack(config: dict):
 
 
 def handle_attack_response(alert_manager, blocker, attack_type: str, src_ip: str,
-                            reasoning: str = None, extra: dict = None):
+                            reasoning: str = None, extra: dict = None,
+                            repeat_offender_count: int = 0):
     """
     Single shared call site for "an ATTACK-level verdict was just
     confirmed, from whichever detector" — used identically for
     per-flow ATTACK (flood-guard / LLM-promoted), aggregate DDoS
-    ATTACK, and per-source port-scan ATTACK. Keeping this as one
-    function (rather than inlining alert+block calls at all three
-    transition points) means the alert-then-block ordering and
-    exception isolation only need to be gotten right once.
+    ATTACK, per-source port-scan ATTACK, and per-(src,dst,port)
+    brute-force ATTACK. Keeping this as one function (rather than
+    inlining alert+block calls at all four transition points) means
+    the alert-then-block ordering and exception isolation only need
+    to be gotten right once.
 
     Alerting is attempted before blocking (not that the order matters
     much — both are independently exception-safe — but conceptually
@@ -143,6 +145,14 @@ def handle_attack_response(alert_manager, blocker, attack_type: str, src_ip: str
     failure in either is caught and logged here so a response-stack
     problem (bad SMTP creds, missing nft binary) never interrupts the
     live detection pipeline that called this.
+
+    `repeat_offender_count` defaults to 0, meaning "use the blocker's
+    plain base duration" — existing callers (per-flow ATTACK, DDoS)
+    don't pass this and are unaffected. Callers whose own tracker
+    already counts repeat offences (BruteForceTracker,
+    PortScanTracker) should pass that count through here so
+    IPBlocker.block() can apply its escalating-duration logic (see
+    response/blocker.py's _effective_duration_minutes).
 
     Returns the blocker's BlockResult (or None if blocking itself
     raised outside of IPBlocker's own error handling — defensive only,
@@ -167,7 +177,11 @@ def handle_attack_response(alert_manager, blocker, attack_type: str, src_ip: str
 
     block_result = None
     try:
-        block_result = blocker.block(src_ip, reason=f"{attack_type}: {reasoning or 'no additional detail'}")
+        block_result = blocker.block(
+            src_ip,
+            reason=f"{attack_type}: {reasoning or 'no additional detail'}",
+            repeat_offender_count=repeat_offender_count,
+        )
     except Exception as e:
         console.print(f"[yellow]Warning:[/yellow] blocking failed for {src_ip}: {e}")
 
@@ -183,7 +197,15 @@ class _NoOpBlocker:
     true no-op, kept as a tiny singleton so it never needs
     constructing per-call.
     """
-    def block(self, ip: str, reason: str = ""):
+    def block(self, ip: str, reason: str = "", repeat_offender_count: int = 0):
+        # repeat_offender_count accepted (and ignored) only so this
+        # satisfies the same call signature handle_attack_response()
+        # now always uses for every attack type, including this
+        # never-actually-blocks DDoS path. Found and fixed before
+        # this shipped: handle_attack_response() unconditionally
+        # passes repeat_offender_count as of the brute-force tracker
+        # wiring, which would otherwise raise a TypeError the very
+        # next time a DDoS ATTACK verdict fired.
         from response.blocker import BlockResult
         return BlockResult(ip=ip, action="block", applied=False, reason="DDoS is multi-source — no single IP to block")
 
@@ -313,6 +335,7 @@ def run_live_capture(config: dict) -> None:
     from detection.logger import DetectionLogger
     from detection.ddos_tracker import GlobalRateTracker, DDoSVerdict
     from detection.port_scan_tracker import PortScanTracker, PortScanVerdict
+    from detection.brute_force_tracker import BruteForceTracker, BruteForceVerdict
     from detection.llm_analyser import LLMAnalyser
     from pipeline.labeller import Labeller
 
@@ -320,6 +343,7 @@ def run_live_capture(config: dict) -> None:
 
     ddos_tracker = GlobalRateTracker(config)
     port_scan_tracker = PortScanTracker(config)
+    brute_force_tracker = BruteForceTracker(config.get("brute_force", {}))
     sniffer = PacketSniffer(
         config,
         on_new_flow=ddos_tracker.record_new_flow,
@@ -370,6 +394,15 @@ def run_live_capture(config: dict) -> None:
     # single flow it generates while ATTACK persists, instead of once
     # on the transition into ATTACK.
     last_port_scan_verdict_by_source: dict[str, PortScanVerdict] = {}
+
+    # Per-(src_ip, dst_ip, dst_port) equivalent for brute-force
+    # verdicts. Same reasoning as above — BruteForceTracker.check()
+    # returns a verdict per triple, not a single global scalar, so a
+    # dict entry per (src, dst, port) key is needed to detect the
+    # transition INTO ATTACK rather than re-triggering
+    # process_brute_force_attack() on every flow while an attack
+    # sequence persists.
+    last_brute_force_verdict_by_key: dict[tuple, BruteForceVerdict] = {}
 
     try:
         with display:
@@ -534,6 +567,63 @@ def run_live_capture(config: dict) -> None:
                             attack_events, "port_scan", port_scan_result.src_ip, reasoning, block_result,
                         )
                     last_port_scan_verdict_by_source[flow.src_ip] = port_scan_result.verdict
+
+                # Per-(src_ip, dst_ip, dst_port) brute-force check —
+                # same structural reason as the port-scan check above
+                # (a per-flow detector can't see "many connection
+                # attempts to one specific auth service over time"),
+                # but keyed on the full destination triple rather than
+                # just source, since brute-forcing targets one
+                # specific service, not a source's overall behaviour.
+                # See detection/brute_force_tracker.py for the
+                # detection logic and its documented "known
+                # limitations" — this is a connection-RATE proxy, not
+                # a confirmed authentication failure.
+                #
+                # Only relevant for watched auth ports (SSH, RDP,
+                # etc. — see config.yaml's brute_force.watched_ports)
+                # — is_watched_port() gates both recording and
+                # checking, so this is a no-op (and effectively free)
+                # for the vast majority of flows that never touch an
+                # auth-related port at all.
+                dst_port = features.get("dst_port")
+                if dst_port is not None and brute_force_tracker.is_watched_port(dst_port):
+                    dst_ip = features.get("dst_ip")
+                    brute_force_tracker.record_attempt(flow.src_ip, dst_ip, dst_port, flow.last_seen)
+                    brute_force_result = brute_force_tracker.check(flow.src_ip, dst_ip, dst_port, flow.last_seen)
+                    key = (flow.src_ip, dst_ip, dst_port)
+                    previous_bf_verdict = last_brute_force_verdict_by_key.get(key, BruteForceVerdict.NORMAL)
+                    if brute_force_result.verdict != previous_bf_verdict:
+                        if brute_force_result.verdict == BruteForceVerdict.ATTACK:
+                            labeller.process_brute_force_attack(brute_force_result)
+                            reasoning = (
+                                f"{brute_force_result.attempts_in_window} connection attempts to "
+                                f"{brute_force_result.dst_ip}:{brute_force_result.dst_port} "
+                                f"in {brute_force_result.window_seconds:.0f}s."
+                            )
+                            # repeat_offender_count is passed through
+                            # so IPBlocker.block() can apply its
+                            # escalating-duration logic — a source
+                            # that's brute-forced this same service
+                            # before gets progressively longer blocks
+                            # (see response/blocker.py's
+                            # _effective_duration_minutes).
+                            block_result = handle_attack_response(
+                                alert_manager, blocker,
+                                attack_type="brute_force",
+                                src_ip=brute_force_result.src_ip,
+                                reasoning=reasoning,
+                                extra={
+                                    "dst_ip": brute_force_result.dst_ip,
+                                    "dst_port": brute_force_result.dst_port,
+                                    "attempts_in_window": brute_force_result.attempts_in_window,
+                                },
+                                repeat_offender_count=brute_force_result.repeat_offender_count,
+                            )
+                            _record_attack_event(
+                                attack_events, "brute_force", brute_force_result.src_ip, reasoning, block_result,
+                            )
+                        last_brute_force_verdict_by_key[key] = brute_force_result.verdict
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow] Flushing current window.")
         sniffer.stop()
@@ -551,6 +641,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     from detection.logger import DetectionLogger
     from detection.ddos_tracker import GlobalRateTracker, DDoSVerdict
     from detection.port_scan_tracker import PortScanTracker, PortScanVerdict
+    from detection.brute_force_tracker import BruteForceTracker, BruteForceVerdict
     from detection.llm_analyser import LLMAnalyser
     from pipeline.labeller import Labeller
 
@@ -562,6 +653,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
 
     ddos_tracker = GlobalRateTracker(config)
     port_scan_tracker = PortScanTracker(config)
+    brute_force_tracker = BruteForceTracker(config.get("brute_force", {}))
     reader = PcapReader(
         config,
         pcap_path,
@@ -587,6 +679,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
 
     last_ddos_verdict = DDoSVerdict.NORMAL
     last_port_scan_verdict_by_source: dict[str, PortScanVerdict] = {}
+    last_brute_force_verdict_by_key: dict[tuple, BruteForceVerdict] = {}
 
     try:
         with display:
@@ -679,6 +772,45 @@ def run_pcap(config: dict, pcap_path: str) -> None:
                             attack_events, "port_scan", port_scan_result.src_ip, reasoning, block_result,
                         )
                     last_port_scan_verdict_by_source[flow.src_ip] = port_scan_result.verdict
+
+                # Per-(src_ip, dst_ip, dst_port) brute-force check —
+                # same wiring as run_live_capture, see that function's
+                # comments for the full reasoning. Replay runs through
+                # this exact logic too, deliberately — the fastest way
+                # to validate brute_force.* thresholds against a
+                # captured real attempt sequence without a live
+                # interface.
+                dst_port = features.get("dst_port")
+                if dst_port is not None and brute_force_tracker.is_watched_port(dst_port):
+                    dst_ip = features.get("dst_ip")
+                    brute_force_tracker.record_attempt(flow.src_ip, dst_ip, dst_port, flow.last_seen)
+                    brute_force_result = brute_force_tracker.check(flow.src_ip, dst_ip, dst_port, flow.last_seen)
+                    key = (flow.src_ip, dst_ip, dst_port)
+                    previous_bf_verdict = last_brute_force_verdict_by_key.get(key, BruteForceVerdict.NORMAL)
+                    if brute_force_result.verdict != previous_bf_verdict:
+                        if brute_force_result.verdict == BruteForceVerdict.ATTACK:
+                            labeller.process_brute_force_attack(brute_force_result)
+                            reasoning = (
+                                f"{brute_force_result.attempts_in_window} connection attempts to "
+                                f"{brute_force_result.dst_ip}:{brute_force_result.dst_port} "
+                                f"in {brute_force_result.window_seconds:.0f}s."
+                            )
+                            block_result = handle_attack_response(
+                                alert_manager, blocker,
+                                attack_type="brute_force",
+                                src_ip=brute_force_result.src_ip,
+                                reasoning=reasoning,
+                                extra={
+                                    "dst_ip": brute_force_result.dst_ip,
+                                    "dst_port": brute_force_result.dst_port,
+                                    "attempts_in_window": brute_force_result.attempts_in_window,
+                                },
+                                repeat_offender_count=brute_force_result.repeat_offender_count,
+                            )
+                            _record_attack_event(
+                                attack_events, "brute_force", brute_force_result.src_ip, reasoning, block_result,
+                            )
+                        last_brute_force_verdict_by_key[key] = brute_force_result.verdict
         replay_completed = True
     except KeyboardInterrupt:
         # Bug fix (found 2026-07-17): this except clause was missing
