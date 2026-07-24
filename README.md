@@ -31,7 +31,7 @@ Along the way this surfaced and fixed several real production-grade issues — k
 
 **Detection (Phase 1–2):** live multi-interface packet capture (or `.pcap` replay) · ~30 features per flow · unsupervised anomaly detection · flood-rate guard · aggregate DDoS tracker · per-source port-scan tracker · LLM self-labelling pipeline (rate-limit-aware retry queue) · supervised classifier (RandomForest/XGBoost) · live colour-coded CLI with BLOCKED/ALLOWED status · JSON-lines logging.
 
-> The classifier is currently effectively untrained (~82 diverse samples, heavy class imbalance) and has two known open precision issues — see [Known issues](#known-issues).
+> The classifier is currently effectively untrained (~82 diverse samples, heavy class imbalance) — the bulk-transfer/`ddos` misclassification issue has a code-level fix pending live verification; flood/DoS separability remains a partial, honestly-labelled improvement, not a full fix. See [Known issues](#known-issues).
 
 **Response (Phase 3 — complete, real-hardware verified):** nftables/iptables auto-blocking with whitelist/private-range safety and dry-run mode (block, expiry, and iptables fallback all verified) · GeoIP lookup (ip-api.com / MaxMind) · email/Slack/webhook alerting (webhook delivery verified live) · full response wiring with pytest coverage.
 
@@ -152,7 +152,7 @@ Full task-by-task checklist and verification log in [`PHASES.md`](PHASES.md).
 
 ## Known issues
 
-- The supervised classifier is currently effectively untrained (~82 diverse current-schema samples, heavy class imbalance), mislabels some large legitimate bulk transfers as `ddos`, and flood/DoS remains only weakly separable from bursty legitimate traffic (`iat_cv` added as a candidate fix, unproven). Actively being worked on.
+- The supervised classifier is currently effectively untrained (~82 diverse current-schema samples, heavy class imbalance) — still the highest-priority gap, since no code fix compensates for too little training data. The bulk-transfer/`ddos` misclassification issue has a code-level fix (`fwd_packet_share`/`ack_ratio` features, plus a canonical-schema-selection fix for a subtler stale-feature-schema bug found afterward) that's pending live re-verification against real traffic. Flood/DoS separability has `iat_cv` as a genuine partial improvement, explicitly not a full fix.
 - `ddos_tracker`/`port_scan_tracker` labelled samples are excluded from classifier training by design — their aggregate-pattern feature schema doesn't match the per-flow features the classifier uses.
 - `Labeller`'s port-scan/DDoS methods and `LLMAnalyser`'s timeout backstop are verified functionally against real traffic but lack dedicated unit tests.
 

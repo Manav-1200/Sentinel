@@ -199,9 +199,11 @@ response:
 alerting:
   # Set to true to send a test alert on startup and verify that your
   # alert channels are configured correctly.
-  # TEMPORARY: leave true while verifying webhook delivery, then set
-  # back to false so you're not getting a synthetic alert every run.
-  test_on_startup: true
+  # Verified working end-to-end against the webhook channel (July
+  # 2026) — set back to false here per the original TEMPORARY note,
+  # so you're not getting a synthetic alert every run. Flip back to
+  # true any time you change alerting config and want to re-verify.
+  test_on_startup: false
 
   # Minimum seconds between alerts for the same source IP.
   # Prevents alert storms when one IP probes repeatedly.

@@ -14,7 +14,7 @@ deterministic and fast, rather than relying on real sleeps.
 """
 
 import pytest
-from brute_force_tracker import BruteForceTracker, BruteForceVerdict
+from detection.brute_force_tracker import BruteForceTracker, BruteForceVerdict
 
 
 DEFAULT_CONFIG = {
