@@ -164,6 +164,134 @@ class TestLabellingWithLLM:
         assert stored.reasoning == "Request timed out"
 
 
+class FakeBruteForceResult:
+    """
+    Minimal stand-in for detection.brute_force_tracker.BruteForceResult
+    — Labeller.process_brute_force_attack() only ever reads these five
+    attributes (src_ip, dst_ip, dst_port, window_seconds,
+    attempts_in_window), so a plain object with just those is
+    sufficient and avoids importing the tracker module into this test
+    file at all.
+    """
+
+    def __init__(self, src_ip="10.0.0.99", dst_ip="192.168.1.50", dst_port=22,
+                 window_seconds=30.0, attempts_in_window=25):
+        self.src_ip = src_ip
+        self.dst_ip = dst_ip
+        self.dst_port = dst_port
+        self.window_seconds = window_seconds
+        self.attempts_in_window = attempts_in_window
+
+
+class TestBruteForceAttack:
+    """
+    Coverage for Labeller.process_brute_force_attack() — the other
+    zero-coverage gap from the 2026-07-24 session. No LLM confirmation
+    is involved (same as process_ddos_attack/process_port_scan_attack),
+    so llm_analyser=None throughout is intentional, not an oversight.
+    """
+
+    def test_stores_with_brute_force_label_and_tracker_source(self, db_config):
+        labeller = Labeller(db_config, llm_analyser=None)
+        result = FakeBruteForceResult()
+
+        stored = labeller.process_brute_force_attack(result)
+
+        assert stored.label == "brute_force"
+        assert stored.label_source == "brute_force_tracker"
+        assert stored.confidence == "high"
+        assert stored.verdict == "ATTACK"
+        # No underlying flow -> no Isolation Forest score, matching
+        # how process_ddos_attack/process_port_scan_attack store theirs.
+        assert stored.anomaly_score is None
+
+    def test_synthetic_features_capture_the_pattern_not_a_real_flow(self, db_config):
+        labeller = Labeller(db_config, llm_analyser=None)
+        result = FakeBruteForceResult(
+            src_ip="203.0.113.9", dst_ip="10.0.0.5", dst_port=3389,
+            window_seconds=60.0, attempts_in_window=40,
+        )
+
+        stored = labeller.process_brute_force_attack(result)
+
+        assert stored.features["detection_type"] == "brute_force"
+        assert stored.features["src_ip"] == "203.0.113.9"
+        assert stored.features["dst_ip"] == "10.0.0.5"
+        assert stored.features["dst_port"] == 3389
+        assert stored.features["window_seconds"] == 60.0
+        assert stored.features["attempts_in_window"] == 40
+
+    def test_reasoning_text_reflects_attempt_rate_not_confirmed_auth_failure(self, db_config):
+        """
+        Honesty note in labeller.py: this is a connection-RATE finding
+        only — Sentinel never inspects payloads, so it can't confirm
+        an actual failed login. The reasoning text must say so
+        explicitly, not imply a confirmed brute-force compromise.
+        """
+        labeller = Labeller(db_config, llm_analyser=None)
+        result = FakeBruteForceResult(
+            src_ip="203.0.113.9", dst_ip="10.0.0.5", dst_port=22,
+            window_seconds=30.0, attempts_in_window=25,
+        )
+
+        stored = labeller.process_brute_force_attack(result)
+
+        assert "203.0.113.9" in stored.reasoning
+        assert "10.0.0.5:22" in stored.reasoning
+        assert "25 connection attempts" in stored.reasoning
+        assert "not a confirmed authentication failure" in stored.reasoning
+
+    def test_no_llm_call_made_even_when_analyser_is_configured(self, db_config):
+        """
+        Like the DDoS and port-scan trackers, a brute-force ATTACK
+        verdict is already deterministic, rule-based evidence — the
+        LLM must never be called to "confirm" it, even if a real
+        analyser is wired in for other purposes.
+        """
+        good_analysis = AnalysisResult(
+            available=True, attack_type="port_scan",
+            confidence=AnalysisConfidence.HIGH, reasoning="unrelated",
+        )
+        fake = FakeAnalyser(good_analysis)
+        labeller = Labeller(db_config, llm_analyser=fake)
+
+        labeller.process_brute_force_attack(FakeBruteForceResult())
+
+        assert fake.analyse_call_count == 0
+
+    def test_does_not_deduplicate_across_repeated_calls(self, db_config):
+        """
+        process_brute_force_attack() has no visibility into prior
+        calls (documented contract, matching process_ddos_attack and
+        process_port_scan_attack) — calling it twice for the same
+        (src_ip, dst_ip, dst_port) stores two separate rows. Caller
+        (main.py) is responsible for calling this only once per
+        transition into ATTACK.
+        """
+        labeller = Labeller(db_config, llm_analyser=None)
+        result = FakeBruteForceResult()
+
+        first = labeller.process_brute_force_attack(result)
+        second = labeller.process_brute_force_attack(result)
+
+        assert first.id != second.id
+        counts = labeller.count_by_label()
+        assert counts == {"brute_force": 2}
+
+    def test_counted_correctly_alongside_other_label_sources(self, db_config):
+        """count_by_label_source() should distinguish brute_force_tracker
+        samples from llm/auto/ddos_tracker/port_scan_tracker samples —
+        the key diagnostic for classifier training-data composition."""
+        labeller = Labeller(db_config, llm_analyser=None)
+
+        labeller.process_brute_force_attack(FakeBruteForceResult())
+        labeller.process(DetectionResult(Verdict.ATTACK, -0.15, ATTACK_FEATURES))  # -> source="auto"
+
+        source_counts = labeller.count_by_label_source()
+        assert source_counts.get("brute_force_tracker") == 1
+        assert source_counts.get("auto") == 1
+
+
 class TestQueryHelpers:
 
     def test_count_by_label_aggregates_correctly(self, db_config):

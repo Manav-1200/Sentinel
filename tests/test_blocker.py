@@ -276,6 +276,142 @@ class TestAuditLog:
 # iptables fallback expiry sweep — the untested Phase 3 gap
 # ------------------------------------------------------------
 
+class TestEscalatingBlockDuration:
+    """
+    Coverage for IPBlocker._effective_duration_minutes() and its wiring
+    into block() — the one piece of the 2026-07-24 brute-force session
+    that shipped with zero test coverage.
+
+    Rule under test (see blocker.py's _effective_duration_minutes
+    docstring): count <= 1 -> base duration unchanged. count >= 2 ->
+    base * min(escalation_multiplier * (count - 1), escalation_max_multiplier).
+    With the defaults (multiplier=3, max=10): 2nd offence = 3x,
+    3rd = 6x, 4th = 9x, 5th+ = capped at 10x.
+    """
+
+    # ------------------------------------------------------------
+    # Pure unit tests against _effective_duration_minutes directly —
+    # no backend/subprocess involved at all.
+    # ------------------------------------------------------------
+
+    def test_first_offence_uses_base_duration_unchanged(self, tmp_path):
+        with patch("response.blocker.shutil.which", return_value=None):
+            blocker = IPBlocker(make_config(tmp_path, block_duration_minutes=60))
+
+        assert blocker._effective_duration_minutes(0) == 60
+        assert blocker._effective_duration_minutes(1) == 60
+
+    def test_second_offence_scales_by_multiplier(self, tmp_path):
+        with patch("response.blocker.shutil.which", return_value=None):
+            blocker = IPBlocker(make_config(
+                tmp_path, block_duration_minutes=60,
+                escalation_multiplier=3, escalation_max_multiplier=10,
+            ))
+
+        # 2nd offence: multiplier * (2 - 1) = 3x
+        assert blocker._effective_duration_minutes(2) == 180
+
+    def test_third_and_fourth_offence_scale_further(self, tmp_path):
+        with patch("response.blocker.shutil.which", return_value=None):
+            blocker = IPBlocker(make_config(
+                tmp_path, block_duration_minutes=60,
+                escalation_multiplier=3, escalation_max_multiplier=10,
+            ))
+
+        assert blocker._effective_duration_minutes(3) == 60 * 6   # 3rd: 3*(3-1)=6x
+        assert blocker._effective_duration_minutes(4) == 60 * 9   # 4th: 3*(4-1)=9x
+
+    def test_escalation_caps_at_max_multiplier(self, tmp_path):
+        with patch("response.blocker.shutil.which", return_value=None):
+            blocker = IPBlocker(make_config(
+                tmp_path, block_duration_minutes=60,
+                escalation_multiplier=3, escalation_max_multiplier=10,
+            ))
+
+        # 5th offence would be 3*(5-1)=12x uncapped -> must clamp to 10x
+        assert blocker._effective_duration_minutes(5) == 60 * 10
+        # A very persistent offender must never exceed the cap either.
+        assert blocker._effective_duration_minutes(1000) == 60 * 10
+
+    def test_custom_multiplier_and_cap_from_config(self, tmp_path):
+        with patch("response.blocker.shutil.which", return_value=None):
+            blocker = IPBlocker(make_config(
+                tmp_path, block_duration_minutes=10,
+                escalation_multiplier=2, escalation_max_multiplier=4,
+            ))
+
+        assert blocker._effective_duration_minutes(1) == 10
+        assert blocker._effective_duration_minutes(2) == 20   # 2*(2-1)=2x
+        assert blocker._effective_duration_minutes(3) == 40   # 2*(3-1)=4x, at the cap
+        assert blocker._effective_duration_minutes(10) == 40  # would be 18x uncapped -> capped at 4x
+
+    # ------------------------------------------------------------
+    # Integration through block() — confirms the escalated duration
+    # actually reaches the backend call and the recorded expiry,
+    # not just the internal helper in isolation.
+    # ------------------------------------------------------------
+
+    def test_block_passes_escalated_duration_to_nftables_backend(self, tmp_path):
+        with patch("response.blocker.shutil.which", return_value="/usr/bin/nft"), \
+             patch("response.blocker.subprocess.run", side_effect=fake_subprocess_run_success) as mock_run:
+            blocker = IPBlocker(make_config(
+                tmp_path, dry_run=False, block_duration_minutes=60,
+                escalation_multiplier=3, escalation_max_multiplier=10,
+            ))
+            mock_run.reset_mock()
+            result = blocker.block("203.0.114.20", reason="repeat brute force", repeat_offender_count=2)
+
+        assert result.applied is True
+        called_cmds = [call.args[0] for call in mock_run.call_args_list]
+        # 2nd offence -> 180 minutes -> "timeout 180m" should appear in the nft element command.
+        assert any("timeout 180m" in " ".join(cmd) for cmd in called_cmds)
+
+    def test_block_default_repeat_offender_count_uses_base_duration(self, tmp_path):
+        """
+        Existing callers (anomaly-detector ATTACK, DDoS ATTACK) never
+        pass repeat_offender_count — confirms the default (0) still
+        produces the plain, unmodified base duration, so this feature
+        is fully backward compatible with every pre-existing call site.
+        """
+        with patch("response.blocker.shutil.which", return_value="/usr/bin/nft"), \
+             patch("response.blocker.subprocess.run", side_effect=fake_subprocess_run_success) as mock_run:
+            blocker = IPBlocker(make_config(tmp_path, dry_run=False, block_duration_minutes=45))
+            mock_run.reset_mock()
+            blocker.block("203.0.114.21", reason="flood guard")
+
+        called_cmds = [call.args[0] for call in mock_run.call_args_list]
+        assert any("timeout 45m" in " ".join(cmd) for cmd in called_cmds)
+
+    def test_block_expiry_reflects_escalated_duration(self, tmp_path):
+        """currently_blocked()'s reported seconds_remaining should be
+        consistent with the escalated duration, not the base one."""
+        with patch("response.blocker.shutil.which", return_value="/usr/bin/nft"), \
+             patch("response.blocker.subprocess.run", side_effect=fake_subprocess_run_success):
+            blocker = IPBlocker(make_config(
+                tmp_path, dry_run=False, block_duration_minutes=10,
+                escalation_multiplier=3, escalation_max_multiplier=10,
+            ))
+            blocker.block("203.0.114.22", repeat_offender_count=3)  # 3rd offence -> 6x -> 60 min
+
+        remaining = blocker.currently_blocked()["203.0.114.22"]
+        # 60 minutes = 3600s; allow generous slack for test execution time.
+        assert 3500 < remaining <= 3600
+
+    def test_dry_run_still_computes_escalated_duration(self, tmp_path):
+        """Dry-run mode must compute and log the SAME escalated
+        duration as a real block would, so operators previewing
+        dry-run behaviour see accurate would-be durations."""
+        with patch("response.blocker.shutil.which", return_value="/usr/bin/nft"):
+            blocker = IPBlocker(make_config(
+                tmp_path, dry_run=True, block_duration_minutes=60,
+                escalation_multiplier=3, escalation_max_multiplier=10,
+            ))
+            blocker.block("203.0.114.23", repeat_offender_count=4)  # 4th -> 9x -> 540 min
+
+        remaining = blocker.currently_blocked()["203.0.114.23"]
+        assert 32390 < remaining <= 32400  # 540 min = 32400s, generous slack
+
+
 class TestIptablesExpirySweep:
     def test_expiry_sweep_removes_expired_block_and_calls_backend_unblock(self, tmp_path):
         with patch("response.blocker.shutil.which", side_effect=lambda name: None if name == "nft" else "/sbin/iptables"), \

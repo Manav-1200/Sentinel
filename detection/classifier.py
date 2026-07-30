@@ -75,7 +75,8 @@ model — but they must never be fed to THIS classifier, which is
 trained and queried exclusively on real per-flow features.
 
 Schema-consistency check across "llm"-sourced samples (fixed July
-2026, second real incident):
+2026, second real incident — and fixed AGAIN, same month, third
+incident):
 --------------------------------------------------------------------
 Restricting to TRAINING_LABEL_SOURCES = {"llm"} fixed the ddos_tracker/
 port_scan_tracker incompatibility above, but a second, more subtle
@@ -94,17 +95,30 @@ caught directly: a real 68,245-packet legitimate outbound transfer
 (confirmed via live testing, July 2026) was still mislabelled "ddos"
 after the fix supposedly landed.
 
-train() now computes the most common feature-key-set (schema) across
-all usable samples and treats it as canonical, EXCLUDING any sample
-whose schema doesn't match exactly — with a loud, visible warning
-naming how many samples were excluded and why. This guarantees the
-classifier is always trained on a single, consistent, CURRENT
-feature schema, and any future features/extractor.py change will
-correctly and visibly age out old-schema samples rather than letting
-them silently win by sheer numbers. If too few current-schema samples
-remain, train() raises the same "not enough data" ValueError as the
-min_samples check always has — an honest refusal rather than a
-silently degraded model.
+The first attempted fix computed the most common feature-key-set
+(schema) across all usable samples via majority vote and treated that
+as canonical. This was a genuine improvement (deterministic, no longer
+dependent on database row order) but simulation-based verification
+(late July 2026, before this had ever been exercised against a real
+majority-old-schema database) surfaced a THIRD version of the exact
+same underlying failure: majority vote only picks the current schema
+correctly once current-schema samples already outnumber stale ones —
+which is never true immediately after a features/extractor.py change,
+i.e. precisely the moment this check exists to protect. A simulated
+700-old/40-new sample split reproduced the original bug exactly, just
+via vote-counting instead of insertion order.
+
+train() now reads canonical schema directly from
+features/extractor.py's CURRENT_FEATURE_KEYS — the single source of
+truth for what a flow's features currently look like — rather than
+inferring it empirically from whatever happens to be sitting in the
+database. Any sample whose feature-key set doesn't exactly match
+CURRENT_FEATURE_KEYS is excluded, with a loud, visible warning naming
+how many samples were excluded and why, exactly as before. This
+guarantees correct behaviour from the very first current-schema
+sample collected, with zero dependency on accumulated sample counts —
+the property the first two fixes were each, in turn, mistakenly
+assumed to already have.
 """
 
 from __future__ import annotations
@@ -123,6 +137,7 @@ from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
 from detection.anomaly import IDENTITY_FIELDS
+from features.extractor import CURRENT_FEATURE_KEYS
 
 
 # Only samples labelled by an actual LLM judgment are used for
@@ -227,24 +242,36 @@ class AttackClassifier:
                 f"accumulate more LLM-labelled data."
             )
 
-        # Schema consistency check (added July 2026 — see module
-        # docstring's "Schema-consistency check" section for the real
-        # incident this fixes). feature_order must come from a
-        # CONSISTENT set of samples, not whichever one happens to be
-        # first — otherwise a features/extractor.py change silently
-        # gets defeated by a majority of stale-schema samples.
+        # Schema consistency check (fixed July 2026 — see module
+        # docstring's "Schema-consistency check" section for the
+        # first incident, and CURRENT_FEATURE_KEYS's docstring in
+        # features/extractor.py for the SECOND incident this specific
+        # version fixes). feature_order must come from a schema that
+        # is actually current, not merely whichever schema happens to
+        # be most common in the database right now — a majority-vote
+        # approach silently picks the STALE schema as "canonical" for
+        # as long as new-schema samples remain a minority, which is
+        # always true immediately after a features/extractor.py
+        # change (exactly when this check matters most). Canonical
+        # schema is instead read directly from CURRENT_FEATURE_KEYS —
+        # the single source of truth for what a flow's features
+        # currently look like — so this is correct from the very first
+        # current-schema sample collected, with zero dependency on
+        # how many old-schema samples still exist in the database.
+        canonical_schema = tuple(sorted(CURRENT_FEATURE_KEYS))
         schema_counts = Counter(
             tuple(sorted(k for k in s.features.keys() if k not in IDENTITY_FIELDS))
             for s in usable
         )
-        canonical_schema, canonical_count = schema_counts.most_common(1)[0]
+        canonical_count = schema_counts.get(canonical_schema, 0)
         stale_count = len(usable) - canonical_count
         if stale_count > 0:
             print(
                 f"[sentinel] WARNING: {stale_count} of {len(usable)} labelled samples "
-                f"have a DIFFERENT feature schema than the current one (most likely "
-                f"from before a features/extractor.py change) and are being EXCLUDED "
-                f"from training to avoid silently training on stale features. Only "
+                f"have a feature schema that doesn't match the CURRENT "
+                f"features/extractor.py output (most likely from before a "
+                f"features/extractor.py change) and are being EXCLUDED from "
+                f"training to avoid silently training on stale features. Only "
                 f"{canonical_count} samples match the current schema and will be used. "
                 f"If this leaves too few samples, keep running Sentinel to accumulate "
                 f"more current-schema data, or clear stale samples from the database."
