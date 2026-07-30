@@ -30,6 +30,15 @@ reduced to a practical subset we can compute cheaply in real time:
   - Burstiness/timing-regularity features (added July 2026)
     distinguish uniform, script-driven timing from normal bursty
     traffic — see "flood/DoS separability" below.
+  - Header-length features (fwd/bwd_header_len_*, added July 2026):
+    header_size was already recorded per-packet to derive
+    payload_size, but was never itself surfaced to the model. Exposed
+    as an explicit mean/max/min/std feature pair (forward/backward,
+    mirroring the packet-size stats above) — a weaker signal on its
+    own than payload/timing/directionality, but a real, already-
+    computed measurement that was previously discarded, and gives the
+    model visibility into unusual TCP option usage (e.g. a stripped-
+    down scanner stack) that packet size alone wouldn't reveal.
 
 None of this module decides what's an attack — it just measures. The
 anomaly detector (Phase 1.4) is what interprets these numbers.
@@ -83,6 +92,60 @@ from capture.sniffer import Flow
 # useful timing or rate information, so we skip it rather than feed
 # the model noisy, low-confidence numbers.
 MIN_PACKETS_FOR_EXTRACTION = 2
+
+
+# The complete, current set of feature keys produced by extract()
+# below, EXCLUDING identity fields (src_ip, dst_ip, src_port, dst_port
+# — see detection/anomaly.py's IDENTITY_FIELDS). This is the ground
+# truth for "what does a current-schema sample look like" — used by
+# detection/classifier.py's train() to pick which stored samples are
+# safe to train on.
+#
+# Why this exists (fixed July 2026, second schema-consistency
+# incident): train() previously derived its notion of "canonical
+# schema" empirically, by majority vote across whatever samples
+# happened to be in the database (Counter.most_common() on each
+# sample's actual feature-key set). That approach silently breaks in
+# exactly the situation it was built for: right after THIS module
+# gains a new feature (as it did for fwd_packet_share/ack_ratio/
+# iat_cv), new-schema samples are — by definition — a small minority
+# for a while. Majority vote then picks the OLD schema as canonical
+# and excludes the very samples the fix was meant to preserve,
+# reproducing the original bug through a different mechanism.
+# Confirmed via direct simulation (July 2026): 700 old-schema samples
+# + 40 new-schema samples reproduced the exact failure, while the
+# reverse ratio (majority new-schema) "happened" to work — meaning the
+# old fix's correctness depended entirely on accumulated sample counts
+# rather than being reliably correct at the moment it mattered most.
+#
+# The fix: canonical schema is no longer inferred from stored data at
+# all. It's read directly from THIS module — the single source of
+# truth for what a flow's features currently look like — so it's
+# correct on the very first sample collected after any future feature
+# change, with zero dependency on how many old-schema samples still
+# exist in the database.
+#
+# Kept in sync with extract() by test_extractor.py, which asserts a
+# real extract() call's output keys (minus identity fields) exactly
+# equal this set — so an extractor.py change that adds/removes a
+# feature without updating this constant fails CI immediately, rather
+# than silently drifting the way the old majority-vote logic did.
+CURRENT_FEATURE_KEYS = frozenset({
+    "protocol",
+    "duration_seconds", "total_packets", "total_bytes",
+    "fwd_packets", "bwd_packets", "fwd_bytes", "bwd_bytes",
+    "bytes_per_second", "packets_per_second",
+    "bwd_fwd_packet_ratio", "fwd_packet_share",
+    "fwd_pkt_len_mean", "fwd_pkt_len_max", "fwd_pkt_len_min", "fwd_pkt_len_std",
+    "bwd_pkt_len_mean", "bwd_pkt_len_max", "bwd_pkt_len_min", "bwd_pkt_len_std",
+    "fwd_header_len_mean", "fwd_header_len_max", "fwd_header_len_min", "fwd_header_len_std",
+    "bwd_header_len_mean", "bwd_header_len_max", "bwd_header_len_min", "bwd_header_len_std",
+    "iat_mean", "iat_max", "iat_min", "iat_std", "iat_cv",
+    "syn_count", "ack_count", "fin_count", "rst_count", "psh_count", "urg_count",
+    "syn_ratio", "ack_ratio",
+    "avg_payload_size", "zero_payload_ratio",
+    "is_well_known_dst_port",
+})
 
 
 def extract(flow: Flow) -> Optional[dict]:
@@ -174,6 +237,24 @@ def extract(flow: Flow) -> Optional[dict]:
     features.update(_size_stats("bwd_pkt_len", backward_packets))
 
     # ------------------------------------------------------------
+    # Header length statistics (forward and backward separately,
+    # added as an explicit feature rather than staying purely
+    # internal). header_size was already recorded per-packet (see
+    # PacketRecord in capture/sniffer.py) to derive payload_size, but
+    # was never itself surfaced to the model. Header size is mostly
+    # constant for a given protocol/options combination (e.g. a bare
+    # TCP header vs. one carrying options like timestamps or SACK), so
+    # it's a much weaker signal on its own than the payload/timing/
+    # directionality features above — but it's a real, free-to-compute
+    # measurement that was already being thrown away, and gives the
+    # model a way to notice unusual option usage (e.g. a scanner using
+    # a stripped-down, options-free TCP stack) that packet size alone
+    # wouldn't reveal.
+    # ------------------------------------------------------------
+    features.update(_header_stats("fwd_header_len", forward_packets))
+    features.update(_header_stats("bwd_header_len", backward_packets))
+
+    # ------------------------------------------------------------
     # Inter-arrival time (IAT) statistics — the gaps between
     # consecutive packets. A normal human-driven connection has
     # irregular, relatively large gaps. A scripted attack (port scan,
@@ -238,6 +319,34 @@ def _size_stats(prefix: str, packets: list) -> dict:
         f"{prefix}_min": min(sizes),
         # statistics.stdev() requires at least 2 data points
         f"{prefix}_std": statistics.stdev(sizes) if len(sizes) >= 2 else 0.0,
+    }
+
+
+def _header_stats(prefix: str, packets: list) -> dict:
+    """
+    Compute mean/max/min/std of header size (IP + transport header
+    bytes — see PacketRecord.header_size in capture/sniffer.py) for a
+    list of packets. Mirrors _size_stats exactly, just reading
+    header_size instead of total packet size. Returns all-zero values
+    for an empty list, same reasoning as _size_stats: the feature
+    vector must always have the same keys regardless of whether this
+    direction had any traffic.
+    """
+    header_sizes = [p.header_size for p in packets]
+
+    if not header_sizes:
+        return {
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_max": 0.0,
+            f"{prefix}_min": 0.0,
+            f"{prefix}_std": 0.0,
+        }
+
+    return {
+        f"{prefix}_mean": statistics.mean(header_sizes),
+        f"{prefix}_max": max(header_sizes),
+        f"{prefix}_min": min(header_sizes),
+        f"{prefix}_std": statistics.stdev(header_sizes) if len(header_sizes) >= 2 else 0.0,
     }
 
 
