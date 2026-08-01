@@ -111,12 +111,14 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
 from detection.anomaly import DetectionResult, Verdict
 from detection.llm_analyser import LLMAnalyser, AnalysisResult, KNOWN_ATTACK_TYPES
+from detection.evidence import Evidence, EvidenceBuffer, from_llm
 
 
 # Fields from a flow's feature dict that get their own dedicated
@@ -170,25 +172,48 @@ class Labeller:
     ATTACK verdict.
     """
 
-    def __init__(self, config: dict, llm_analyser: Optional[LLMAnalyser] = None):
+    def __init__(self, config: dict, llm_analyser: Optional[LLMAnalyser] = None,
+                 evidence_buffer: Optional[EvidenceBuffer] = None):
         """
         llm_analyser is accepted as an optional, already-constructed
         instance (rather than building one internally) so callers can
         share a single LLMAnalyser — and its rate limiter state —
         across the whole pipeline, and so tests can inject a fake
         analyser without needing real API credentials.
+
+        evidence_buffer works the same way: main.py constructs ONE
+        EvidenceBuffer and passes it to both itself (for the four
+        tracker-based from_* calls) and here (so the LLM path's
+        from_llm() Evidence lands in the same shared buffer, not a
+        second, disconnected one). If no buffer is passed — e.g. from
+        try_train_classifier()/run_label(), which construct a Labeller
+        with llm_analyser=None purely for read-only DB access — a
+        private, unused-in-practice EvidenceBuffer is created instead
+        so store_evidence() never has to check for None.
         """
         self.db_path: str = config["storage"]["db_path"]
         self.llm_analyser = llm_analyser
+        self.evidence_buffer = evidence_buffer or EvidenceBuffer(
+            config.get("evidence", {}).get("buffer_window_seconds", 300.0)
+        )
         self._ensure_schema()
 
-    def process(self, result: DetectionResult) -> Optional[LabelledSample]:
+    def process(self, result: DetectionResult, timestamp: Optional[float] = None) -> Optional[LabelledSample]:
         """
         Process one PER-FLOW detection result. Returns the
         LabelledSample that was stored, or None if this result didn't
         warrant storage at all (e.g. a NORMAL or WARMING_UP verdict —
         only SUSPICIOUS/ATTACK flows are ever labelled or stored
         here).
+
+        `timestamp` should be the underlying flow's own timestamp
+        (flow.last_seen from main.py's per-flow loop), matching the
+        pcap-replay-safe convention every other Evidence construction
+        site already follows (see detection/evidence.py) — NOT
+        time.time(). Defaults to None only for callers that don't care
+        about Evidence timestamping precision (e.g. try_train_classifier's
+        read-only Labeller), in which case the current wall-clock time
+        is used as a fallback.
 
         For aggregate DDoS detections (no single underlying flow),
         see process_ddos_attack() instead. For per-source port-scan
@@ -211,6 +236,23 @@ class Labeller:
                 verdict=result.verdict.value,
             )
             label, source, confidence, reasoning = self._interpret_analysis(analysis)
+
+            # Universal Evidence Object for this LLM finding. Unlike
+            # the four tracker-based detectors (whose Evidence is
+            # built directly in main.py, right at their own check()
+            # call sites), the LLM's AnalysisResult carries no
+            # identity of its own — this is the one place that has
+            # both the AnalysisResult AND the originating flow's
+            # features in scope at the same time, so it's the correct
+            # (and only sane) place to call from_llm().
+            llm_evidence = from_llm(
+                analysis,
+                timestamp if timestamp is not None else time.time(),
+                src_ip=result.features.get("src_ip"),
+                dst_ip=result.features.get("dst_ip"),
+                dst_port=result.features.get("dst_port"),
+            )
+            self.store_evidence(llm_evidence)
 
             # Promotion: a flow that arrived here as SUSPICIOUS (i.e.
             # flagged only by the Isolation Forest's statistical
@@ -405,6 +447,37 @@ class Labeller:
     # Internal
     # ------------------------------------------------------------
 
+    def store_evidence(self, evidence: Evidence) -> None:
+        """
+        The single call site for "an Evidence object was just built,
+        make sure both halves of its storage happen" — persists it to
+        the evidence DB table AND adds it to the shared in-memory
+        EvidenceBuffer, so callers (main.py's four tracker-based
+        from_* sites, and process()'s from_llm() site above) never
+        have to remember to do both separately or risk them drifting
+        out of sync.
+        """
+        conn = self._connect()
+        try:
+            row = evidence.to_dict()
+            payload_json = json.dumps(row.pop("payload"))
+            conn.execute(
+                """
+                INSERT INTO evidence
+                    (evidence_id, detector, timestamp, verdict, reasoning, src_ip, dst_ip, dst_port, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["evidence_id"], row["detector"], row["timestamp"], row["verdict"],
+                    row["reasoning"], row["src_ip"], row["dst_ip"], row["dst_port"], payload_json,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.evidence_buffer.add(evidence)
+
     def _interpret_analysis(self, analysis: AnalysisResult) -> tuple[str, str, str, Optional[str]]:
         if not analysis.available:
             # LLM call failed for any reason — record that fact
@@ -497,6 +570,33 @@ class Labeller:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_label ON labelled_flows(label)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_label_source ON labelled_flows(label_source)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON labelled_flows(timestamp)")
+
+            # Universal Evidence Object table — separate from
+            # labelled_flows on purpose. labelled_flows is the Phase 2
+            # classifier's training-data table (one row per flow, with
+            # a single chosen label); evidence is the raw, unopinionated
+            # record of every detector finding, one row per Evidence
+            # object, kept for the future Incident Correlation Engine
+            # to query across detectors. The two tables serve different
+            # consumers and shouldn't be conflated into one schema.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS evidence (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    evidence_id TEXT NOT NULL,
+                    detector TEXT NOT NULL,
+                    timestamp REAL NOT NULL,
+                    verdict TEXT NOT NULL,
+                    reasoning TEXT,
+                    src_ip TEXT,
+                    dst_ip TEXT,
+                    dst_port INTEGER,
+                    payload TEXT NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_detector ON evidence(detector)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_src_ip ON evidence(src_ip)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_timestamp ON evidence(timestamp)")
+
             conn.commit()
         finally:
             conn.close()
