@@ -337,9 +337,19 @@ def run_live_capture(config: dict) -> None:
     from detection.port_scan_tracker import PortScanTracker, PortScanVerdict
     from detection.brute_force_tracker import BruteForceTracker, BruteForceVerdict
     from detection.llm_analyser import LLMAnalyser
+    from detection.evidence import (
+        EvidenceBuffer, from_anomaly, from_ddos, from_port_scan, from_brute_force,
+    )
     from pipeline.labeller import Labeller
 
     print_banner(config, mode="live capture")
+
+    # Universal Evidence Object buffer — bounded in-memory view for the
+    # future Incident Correlation Engine. Every Evidence built below is
+    # ALSO expected to be persisted via the labeller's DB path (see the
+    # TODO at each construction site below — that wiring is pending
+    # pipeline/labeller.py's storage function).
+    evidence_buffer = EvidenceBuffer(config.get("evidence", {}).get("buffer_window_seconds", 300.0))
 
     ddos_tracker = GlobalRateTracker(config)
     port_scan_tracker = PortScanTracker(config)
@@ -353,7 +363,7 @@ def run_live_capture(config: dict) -> None:
     detector = AnomalyDetector(config)
     logger = DetectionLogger(config)
     llm_analyser = LLMAnalyser(config)
-    labeller = Labeller(config, llm_analyser=llm_analyser)
+    labeller = Labeller(config, llm_analyser=llm_analyser, evidence_buffer=evidence_buffer)
 
     # Phase 3: GeoIP enrichment, alerting, and auto-blocking — one
     # shared stack for the whole pipeline. See build_response_stack().
@@ -414,6 +424,15 @@ def run_live_capture(config: dict) -> None:
                 result = detector.predict(features)
                 display.dropped_packet_count = sniffer.dropped_packet_count
 
+                # Universal Evidence Object — normalise this detector's
+                # finding for the future correlation engine. Timestamped
+                # from flow.last_seen (not time.time()) so this stays
+                # correct during pcap replay too — see evidence.py.
+                # TODO(evidence-storage): once pipeline/labeller.py has a
+                # dedicated store_evidence()-style method, persist this
+                # to the DB here too, not just the in-memory buffer.
+                labeller.store_evidence(from_anomaly(result, flow.last_seen))
+
                 # Multicast/broadcast destinations (SSDP/UPnP, mDNS,
                 # etc.) are normal LAN chatter that can still trip
                 # SUSPICIOUS on an unusual burst — but the classifier
@@ -464,7 +483,7 @@ def run_live_capture(config: dict) -> None:
                 # wrong label fed back into training only reinforces
                 # itself. Detection/logging above are untouched.
                 if not is_multicast_dst:
-                    labeller.process(result)
+                    labeller.process(result, timestamp=flow.last_seen)
 
                 # Phase 3: a per-flow ATTACK verdict here is always
                 # either the deterministic flood-guard or an
@@ -500,6 +519,10 @@ def run_live_capture(config: dict) -> None:
                 # evidence). Only done on the transition INTO ATTACK,
                 # not on every flow processed while it persists.
                 ddos_result = ddos_tracker.check(flow.last_seen)
+                # See TODO(evidence-storage) note above the anomaly
+                # Evidence construction — same pending DB-persist wiring
+                # applies to every from_* call in this loop.
+                labeller.store_evidence(from_ddos(ddos_result, flow.last_seen))
                 if ddos_result.verdict != last_ddos_verdict:
                     display.set_ddos_status(ddos_result)
                     if ddos_result.verdict == DDoSVerdict.ATTACK:
@@ -542,6 +565,7 @@ def run_live_capture(config: dict) -> None:
                 # that's the only source we have fresh information for
                 # right now.
                 port_scan_result = port_scan_tracker.check(flow.src_ip, flow.last_seen)
+                labeller.store_evidence(from_port_scan(port_scan_result, flow.last_seen))
                 previous_verdict = last_port_scan_verdict_by_source.get(
                     flow.src_ip, PortScanVerdict.NORMAL
                 )
@@ -591,6 +615,7 @@ def run_live_capture(config: dict) -> None:
                     dst_ip = features.get("dst_ip")
                     brute_force_tracker.record_attempt(flow.src_ip, dst_ip, dst_port, flow.last_seen)
                     brute_force_result = brute_force_tracker.check(flow.src_ip, dst_ip, dst_port, flow.last_seen)
+                    labeller.store_evidence(from_brute_force(brute_force_result, flow.last_seen))
                     key = (flow.src_ip, dst_ip, dst_port)
                     previous_bf_verdict = last_brute_force_verdict_by_key.get(key, BruteForceVerdict.NORMAL)
                     if brute_force_result.verdict != previous_bf_verdict:
@@ -643,6 +668,9 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     from detection.port_scan_tracker import PortScanTracker, PortScanVerdict
     from detection.brute_force_tracker import BruteForceTracker, BruteForceVerdict
     from detection.llm_analyser import LLMAnalyser
+    from detection.evidence import (
+        EvidenceBuffer, from_anomaly, from_ddos, from_port_scan, from_brute_force,
+    )
     from pipeline.labeller import Labeller
 
     print_banner(config, mode=f"pcap replay — {pcap_path}")
@@ -650,6 +678,10 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     if not os.path.exists(pcap_path):
         console.print(f"[red]Error:[/red] pcap file not found: '{pcap_path}'")
         sys.exit(1)
+
+    # See run_live_capture's matching comment — same buffer, same
+    # pending DB-persist TODO.
+    evidence_buffer = EvidenceBuffer(config.get("evidence", {}).get("buffer_window_seconds", 300.0))
 
     ddos_tracker = GlobalRateTracker(config)
     port_scan_tracker = PortScanTracker(config)
@@ -664,7 +696,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     detector = AnomalyDetector(config)
     logger = DetectionLogger(config)
     llm_analyser = LLMAnalyser(config)
-    labeller = Labeller(config, llm_analyser=llm_analyser)
+    labeller = Labeller(config, llm_analyser=llm_analyser, evidence_buffer=evidence_buffer)
     classifier = try_train_classifier(config)
 
     # Phase 3 response stack — same wiring as run_live_capture. Replay
@@ -689,6 +721,11 @@ def run_pcap(config: dict, pcap_path: str) -> None:
                     continue
                 result = detector.predict(features)
 
+                # Universal Evidence Object — see run_live_capture's
+                # matching comment for the full rationale and the
+                # pending DB-persist TODO.
+                labeller.store_evidence(from_anomaly(result, flow.last_seen))
+
                 # See _is_multicast_or_broadcast_destination()'s
                 # docstring — gates the classifier label and training
                 # storage only, never verdict/blocking.
@@ -704,7 +741,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
                 display.add(result, predicted_label=predicted_label)
                 logger.log(result)
                 if not is_multicast_dst:
-                    labeller.process(result)
+                    labeller.process(result, timestamp=flow.last_seen)
 
                 if result.verdict.value == "ATTACK":
                     src_ip = features.get("src_ip")
@@ -722,6 +759,10 @@ def run_pcap(config: dict, pcap_path: str) -> None:
                         )
 
                 ddos_result = ddos_tracker.check(flow.last_seen)
+                # See TODO(evidence-storage) note above the anomaly
+                # Evidence construction — same pending DB-persist wiring
+                # applies to every from_* call in this loop.
+                labeller.store_evidence(from_ddos(ddos_result, flow.last_seen))
                 if ddos_result.verdict != last_ddos_verdict:
                     display.set_ddos_status(ddos_result)
                     if ddos_result.verdict == DDoSVerdict.ATTACK:
@@ -747,6 +788,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
                     last_ddos_verdict = ddos_result.verdict
 
                 port_scan_result = port_scan_tracker.check(flow.src_ip, flow.last_seen)
+                labeller.store_evidence(from_port_scan(port_scan_result, flow.last_seen))
                 previous_verdict = last_port_scan_verdict_by_source.get(
                     flow.src_ip, PortScanVerdict.NORMAL
                 )
@@ -785,6 +827,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
                     dst_ip = features.get("dst_ip")
                     brute_force_tracker.record_attempt(flow.src_ip, dst_ip, dst_port, flow.last_seen)
                     brute_force_result = brute_force_tracker.check(flow.src_ip, dst_ip, dst_port, flow.last_seen)
+                    labeller.store_evidence(from_brute_force(brute_force_result, flow.last_seen))
                     key = (flow.src_ip, dst_ip, dst_port)
                     previous_bf_verdict = last_brute_force_verdict_by_key.get(key, BruteForceVerdict.NORMAL)
                     if brute_force_result.verdict != previous_bf_verdict:
