@@ -340,6 +340,7 @@ def run_live_capture(config: dict) -> None:
     from detection.evidence import (
         EvidenceBuffer, from_anomaly, from_ddos, from_port_scan, from_brute_force,
     )
+    from detection.correlation_engine import CorrelationEngine
     from pipeline.labeller import Labeller
 
     print_banner(config, mode="live capture")
@@ -350,6 +351,7 @@ def run_live_capture(config: dict) -> None:
     # TODO at each construction site below — that wiring is pending
     # pipeline/labeller.py's storage function).
     evidence_buffer = EvidenceBuffer(config.get("evidence", {}).get("buffer_window_seconds", 300.0))
+    correlation_engine = CorrelationEngine()
 
     ddos_tracker = GlobalRateTracker(config)
     port_scan_tracker = PortScanTracker(config)
@@ -363,7 +365,7 @@ def run_live_capture(config: dict) -> None:
     detector = AnomalyDetector(config)
     logger = DetectionLogger(config)
     llm_analyser = LLMAnalyser(config)
-    labeller = Labeller(config, llm_analyser=llm_analyser, evidence_buffer=evidence_buffer)
+    labeller = Labeller(config, llm_analyser=llm_analyser, evidence_buffer=evidence_buffer, correlation_engine=correlation_engine)
 
     # Phase 3: GeoIP enrichment, alerting, and auto-blocking — one
     # shared stack for the whole pipeline. See build_response_stack().
@@ -671,6 +673,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     from detection.evidence import (
         EvidenceBuffer, from_anomaly, from_ddos, from_port_scan, from_brute_force,
     )
+    from detection.correlation_engine import CorrelationEngine
     from pipeline.labeller import Labeller
 
     print_banner(config, mode=f"pcap replay — {pcap_path}")
@@ -682,6 +685,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     # See run_live_capture's matching comment — same buffer, same
     # pending DB-persist TODO.
     evidence_buffer = EvidenceBuffer(config.get("evidence", {}).get("buffer_window_seconds", 300.0))
+    correlation_engine = CorrelationEngine()
 
     ddos_tracker = GlobalRateTracker(config)
     port_scan_tracker = PortScanTracker(config)
@@ -696,7 +700,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     detector = AnomalyDetector(config)
     logger = DetectionLogger(config)
     llm_analyser = LLMAnalyser(config)
-    labeller = Labeller(config, llm_analyser=llm_analyser, evidence_buffer=evidence_buffer)
+    labeller = Labeller(config, llm_analyser=llm_analyser, evidence_buffer=evidence_buffer, correlation_engine=correlation_engine)
     classifier = try_train_classifier(config)
 
     # Phase 3 response stack — same wiring as run_live_capture. Replay
