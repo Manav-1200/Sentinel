@@ -119,6 +119,7 @@ from typing import Optional
 from detection.anomaly import DetectionResult, Verdict
 from detection.llm_analyser import LLMAnalyser, AnalysisResult, KNOWN_ATTACK_TYPES
 from detection.evidence import Evidence, EvidenceBuffer, from_llm
+from detection.correlation_engine import CorrelationEngine
 
 
 # Fields from a flow's feature dict that get their own dedicated
@@ -173,7 +174,8 @@ class Labeller:
     """
 
     def __init__(self, config: dict, llm_analyser: Optional[LLMAnalyser] = None,
-                 evidence_buffer: Optional[EvidenceBuffer] = None):
+                 evidence_buffer: Optional[EvidenceBuffer] = None,
+                 correlation_engine: Optional[CorrelationEngine] = None):
         """
         llm_analyser is accepted as an optional, already-constructed
         instance (rather than building one internally) so callers can
@@ -181,21 +183,22 @@ class Labeller:
         across the whole pipeline, and so tests can inject a fake
         analyser without needing real API credentials.
 
-        evidence_buffer works the same way: main.py constructs ONE
-        EvidenceBuffer and passes it to both itself (for the four
-        tracker-based from_* calls) and here (so the LLM path's
-        from_llm() Evidence lands in the same shared buffer, not a
-        second, disconnected one). If no buffer is passed — e.g. from
-        try_train_classifier()/run_label(), which construct a Labeller
-        with llm_analyser=None purely for read-only DB access — a
-        private, unused-in-practice EvidenceBuffer is created instead
-        so store_evidence() never has to check for None.
+        evidence_buffer and correlation_engine both work the same way:
+        main.py constructs ONE of each and passes them here, so the
+        LLM path's from_llm() Evidence lands in the same shared
+        buffer/engine as the four tracker-based from_* calls, not a
+        second, disconnected instance. If either isn't passed — e.g.
+        from try_train_classifier()/run_label(), which construct a
+        Labeller with llm_analyser=None purely for read-only DB access
+        — a private, unused-in-practice instance of each is created
+        instead so store_evidence() never has to check for None.
         """
         self.db_path: str = config["storage"]["db_path"]
         self.llm_analyser = llm_analyser
         self.evidence_buffer = evidence_buffer or EvidenceBuffer(
             config.get("evidence", {}).get("buffer_window_seconds", 300.0)
         )
+        self.correlation_engine = correlation_engine or CorrelationEngine()
         self._ensure_schema()
 
     def process(self, result: DetectionResult, timestamp: Optional[float] = None) -> Optional[LabelledSample]:
@@ -450,12 +453,14 @@ class Labeller:
     def store_evidence(self, evidence: Evidence) -> None:
         """
         The single call site for "an Evidence object was just built,
-        make sure both halves of its storage happen" — persists it to
-        the evidence DB table AND adds it to the shared in-memory
-        EvidenceBuffer, so callers (main.py's four tracker-based
-        from_* sites, and process()'s from_llm() site above) never
-        have to remember to do both separately or risk them drifting
-        out of sync.
+        make sure every half of its storage happens" — persists it to
+        the evidence DB table, adds it to the shared in-memory
+        EvidenceBuffer, AND files it into the shared CorrelationEngine
+        (which groups it into an Incident, or ignores it, per that
+        engine's own rules — see correlation_engine.py). Callers
+        (main.py's four tracker-based from_* sites, and process()'s
+        from_llm() site above) never have to remember to do all three
+        separately or risk them drifting out of sync.
         """
         conn = self._connect()
         try:
@@ -475,6 +480,8 @@ class Labeller:
             conn.commit()
         finally:
             conn.close()
+
+        self.correlation_engine.add_evidence(evidence)
 
         self.evidence_buffer.add(evidence)
 

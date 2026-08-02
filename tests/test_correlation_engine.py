@@ -238,3 +238,4 @@ class TestFirstLastSeen:
         incident = engine.add_evidence(bf2)
         assert incident.first_seen == 100.0
         assert incident.last_seen == 500.0
+        
