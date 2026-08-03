@@ -119,7 +119,10 @@ from typing import Optional
 from detection.anomaly import DetectionResult, Verdict
 from detection.llm_analyser import LLMAnalyser, AnalysisResult, KNOWN_ATTACK_TYPES
 from detection.evidence import Evidence, EvidenceBuffer, from_llm
-from detection.correlation_engine import CorrelationEngine
+from detection.correlation_engine import CorrelationEngine, AGGREGATE_KEY
+from observability.structured_logger import (
+    get_structured_logger, log_evidence_created, log_incident_event,
+)
 
 
 # Fields from a flow's feature dict that get their own dedicated
@@ -199,6 +202,7 @@ class Labeller:
             config.get("evidence", {}).get("buffer_window_seconds", 300.0)
         )
         self.correlation_engine = correlation_engine or CorrelationEngine()
+        self._event_logger = get_structured_logger(config)
         self._ensure_schema()
 
     def process(self, result: DetectionResult, timestamp: Optional[float] = None) -> Optional[LabelledSample]:
@@ -482,6 +486,22 @@ class Labeller:
             conn.close()
 
         self.correlation_engine.add_evidence(evidence)
+
+        log_evidence_created(self._event_logger, evidence)
+
+        # Log the incident lifecycle transition too. is_new is a
+        # heuristic (exactly one evidence item means this Evidence
+        # just OPENED the incident) rather than a first-class signal
+        # from CorrelationEngine.add_evidence() - acceptable since this
+        # is a logging-only concern, not something correctness-critical
+        # depends on. See structured_logger.py's log_incident_event
+        # docstring.
+        incident = self.correlation_engine.get_incident(
+            evidence.src_ip if evidence.src_ip is not None else AGGREGATE_KEY
+        )
+        if incident is not None:
+            is_new = len(incident.evidence) == 1
+            log_incident_event(self._event_logger, incident, is_new=is_new)
 
         self.evidence_buffer.add(evidence)
 

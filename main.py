@@ -353,6 +353,28 @@ def run_live_capture(config: dict) -> None:
     evidence_buffer = EvidenceBuffer(config.get("evidence", {}).get("buffer_window_seconds", 300.0))
     correlation_engine = CorrelationEngine()
 
+    # Incidents REST API — runs in the SAME process as the capture
+    # loop, sharing this exact correlation_engine instance (not a copy)
+    # so /incidents reflects real-time state. See api/app.py's module
+    # docstring for why this must be same-process, not a separate
+    # reader of a stale snapshot. Config-driven and defaults to
+    # enabled=True — set api.enabled: false in config.yaml to disable
+    # entirely.
+    api_config = config.get("api", {})
+    if api_config.get("enabled", True):
+        import threading
+        import uvicorn
+        from api.app import create_app
+
+        api_app = create_app(correlation_engine)
+        api_host = api_config.get("host", "127.0.0.1")
+        api_port = int(api_config.get("port", 8787))
+        uvicorn_config = uvicorn.Config(api_app, host=api_host, port=api_port, log_level="warning")
+        api_server = uvicorn.Server(uvicorn_config)
+        api_thread = threading.Thread(target=api_server.run, daemon=True)
+        api_thread.start()
+        console.print(f"[dim]Incidents API listening on http://{api_host}:{api_port} (docs at /docs)[/dim]")
+
     ddos_tracker = GlobalRateTracker(config)
     port_scan_tracker = PortScanTracker(config)
     brute_force_tracker = BruteForceTracker(config.get("brute_force", {}))
