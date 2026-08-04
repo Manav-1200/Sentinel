@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 
 from detection.correlation_engine import Incident, AGGREGATE_KEY
 from detection.risk_engine import RiskAssessment, assess
-from detection.mitre_attack import techniques_for_incident
+from detection.mitre_attack import get_techniques_for_incident as techniques_for_incident
 from detection.timeline import render_timeline_text
 
 
