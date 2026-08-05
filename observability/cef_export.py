@@ -57,9 +57,12 @@ import socket
 import time
 from typing import Optional
 
+from typing import Optional
+
 from detection.evidence import Evidence, EvidenceVerdict
 from detection.correlation_engine import Incident
 from detection.risk_engine import RiskAssessment, RiskTier
+from detection.mitre_attack import MitreTechnique
 
 
 CEF_VENDOR = "Sentinel"
@@ -143,17 +146,31 @@ def evidence_to_cef(evidence: Evidence) -> str:
     return f"{_cef_header(signature_id, name, severity)}|{extension}"
 
 
-def incident_to_cef(incident: Incident, risk: RiskAssessment) -> str:
+def incident_to_cef(
+    incident: Incident,
+    risk: RiskAssessment,
+    techniques: Optional[list[MitreTechnique]] = None,
+) -> str:
     """
     Renders one Incident (plus its already-computed RiskAssessment) as
     a single CEF event line - the fused, corroborated view, not a raw
     per-detector finding. `risk` is passed in rather than computed
     here so the caller controls exactly when risk_engine.assess() runs
     (see risk_engine.py's own note on on-demand vs. cached scoring).
+
+    `techniques` is likewise passed in rather than computed here, for
+    the same reason - the caller (Labeller.store_evidence()) already
+    has to call detection.mitre_attack.get_techniques_for_incident()
+    for its own purposes, so this function shouldn't recompute it a
+    second time. Optional and defaults to None/empty - a SIEM listener
+    that doesn't care about ATT&CK mapping still gets a valid CEF line
+    either way, just without cs3.
     """
     signature_id = f"incident.{incident.status.value}"
     name = f"Sentinel incident ({risk.tier.value}): {incident.key}"
     severity = _RISK_TIER_SEVERITY.get(risk.tier, 0)
+
+    technique_ids = ",".join(t.technique_id for t in (techniques or []))
 
     extension = _cef_extension({
         "rt": int(incident.last_seen * 1000),
@@ -166,6 +183,8 @@ def incident_to_cef(incident: Incident, risk: RiskAssessment) -> str:
         "cs1": ",".join(sorted(incident.detectors_involved)),
         "cs2Label": "incidentStatus",
         "cs2": incident.status.value,
+        "cs3Label": "mitreTechniques",
+        "cs3": technique_ids or None,
     })
     return f"{_cef_header(signature_id, name, severity)}|{extension}"
 
@@ -198,8 +217,13 @@ class CEFSyslogExporter:
     def send_evidence(self, evidence: Evidence) -> None:
         self._safe_send(evidence_to_cef(evidence))
 
-    def send_incident(self, incident: Incident, risk: RiskAssessment) -> None:
-        self._safe_send(incident_to_cef(incident, risk))
+    def send_incident(
+        self,
+        incident: Incident,
+        risk: RiskAssessment,
+        techniques: Optional[list[MitreTechnique]] = None,
+    ) -> None:
+        self._safe_send(incident_to_cef(incident, risk, techniques=techniques))
 
     def _safe_send(self, cef_line: str) -> None:
         """A SIEM being unreachable is a real, expected operational

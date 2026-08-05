@@ -120,8 +120,14 @@ from detection.anomaly import DetectionResult, Verdict
 from detection.llm_analyser import LLMAnalyser, AnalysisResult, KNOWN_ATTACK_TYPES
 from detection.evidence import Evidence, EvidenceBuffer, from_llm
 from detection.correlation_engine import CorrelationEngine, AGGREGATE_KEY
+from detection.risk_engine import assess as assess_risk
+from detection.mitre_attack import get_techniques_for_incident
 from observability.structured_logger import (
     get_structured_logger, log_evidence_created, log_incident_event,
+)
+from observability.metrics import (
+    SentinelMetrics, record_evidence, record_incident_event,
+    set_incidents_open_current, record_risk_assessment,
 )
 
 
@@ -178,7 +184,9 @@ class Labeller:
 
     def __init__(self, config: dict, llm_analyser: Optional[LLMAnalyser] = None,
                  evidence_buffer: Optional[EvidenceBuffer] = None,
-                 correlation_engine: Optional[CorrelationEngine] = None):
+                 correlation_engine: Optional[CorrelationEngine] = None,
+                 metrics: Optional[SentinelMetrics] = None,
+                 cef_exporter=None):
         """
         llm_analyser is accepted as an optional, already-constructed
         instance (rather than building one internally) so callers can
@@ -195,6 +203,18 @@ class Labeller:
         Labeller with llm_analyser=None purely for read-only DB access
         — a private, unused-in-practice instance of each is created
         instead so store_evidence() never has to check for None.
+
+        metrics (observability.metrics.SentinelMetrics) and
+        cef_exporter (observability.cef_export.CEFSyslogExporter) are
+        both optional and both default to doing nothing if omitted —
+        e.g. try_train_classifier()/run_label()'s read-only Labeller
+        instances have no reason to touch either. When main.py DOES
+        pass them (see run_live_capture/run_pcap), store_evidence()
+        becomes the single call site for every observability output
+        Sentinel produces for a given Evidence/Incident, mirroring the
+        same "one call site does all the bookkeeping" reasoning this
+        method already applies to DB persistence + buffer + engine
+        filing + structured logging.
         """
         self.db_path: str = config["storage"]["db_path"]
         self.llm_analyser = llm_analyser
@@ -203,6 +223,8 @@ class Labeller:
         )
         self.correlation_engine = correlation_engine or CorrelationEngine()
         self._event_logger = get_structured_logger(config)
+        self.metrics = metrics
+        self.cef_exporter = cef_exporter
         self._ensure_schema()
 
     def process(self, result: DetectionResult, timestamp: Optional[float] = None) -> Optional[LabelledSample]:
@@ -489,6 +511,12 @@ class Labeller:
 
         log_evidence_created(self._event_logger, evidence)
 
+        if self.metrics is not None:
+            record_evidence(self.metrics, evidence)
+
+        if self.cef_exporter is not None:
+            self.cef_exporter.send_evidence(evidence)
+
         # Log the incident lifecycle transition too. is_new is a
         # heuristic (exactly one evidence item means this Evidence
         # just OPENED the incident) rather than a first-class signal
@@ -502,6 +530,29 @@ class Labeller:
         if incident is not None:
             is_new = len(incident.evidence) == 1
             log_incident_event(self._event_logger, incident, is_new=is_new)
+
+            # Risk assessment and MITRE technique tagging both happen
+            # HERE, on every evidence-triggered incident update, rather
+            # than only on-demand from the API/reporting layer - this
+            # is what lets metrics/CEF export reflect the incident's
+            # CURRENT fused risk in near-real-time instead of only
+            # whenever someone happens to query /incidents or generate
+            # a report. assess_risk() and get_techniques_for_incident()
+            # are both cheap, pure functions over data already in
+            # memory (no I/O), so calling them on every incident update
+            # here is not a meaningful cost - this mirrors risk_engine.py
+            # and mitre_attack.py's own "caller decides when to compute,
+            # it's cheap enough to just do it" design notes.
+            risk = assess_risk(incident)
+            techniques = get_techniques_for_incident(incident)
+
+            if self.metrics is not None:
+                record_incident_event(self.metrics, incident, is_new=is_new)
+                set_incidents_open_current(self.metrics, len(self.correlation_engine.open_incidents()))
+                record_risk_assessment(self.metrics, risk)
+
+            if self.cef_exporter is not None:
+                self.cef_exporter.send_incident(incident, risk, techniques=techniques)
 
         self.evidence_buffer.add(evidence)
 

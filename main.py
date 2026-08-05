@@ -342,6 +342,8 @@ def run_live_capture(config: dict) -> None:
     )
     from detection.correlation_engine import CorrelationEngine
     from pipeline.labeller import Labeller
+    from observability.metrics import get_metrics, mount_metrics
+    from observability.cef_export import CEFSyslogExporter
 
     print_banner(config, mode="live capture")
 
@@ -352,6 +354,31 @@ def run_live_capture(config: dict) -> None:
     # pipeline/labeller.py's storage function).
     evidence_buffer = EvidenceBuffer(config.get("evidence", {}).get("buffer_window_seconds", 300.0))
     correlation_engine = CorrelationEngine()
+
+    # Prometheus metrics — one shared SentinelMetrics instance for the
+    # whole process (see observability/metrics.py's singleton note).
+    # Constructed unconditionally (recording into it costs nothing if
+    # nobody ever scrapes /metrics) — whether it's actually SERVEABLE
+    # depends on the incidents API being enabled below, since metrics
+    # mounts onto that same FastAPI app rather than running its own
+    # server (see mount_metrics()'s own docstring for why).
+    metrics = get_metrics()
+
+    # SIEM (CEF) export — config-driven, off by default. A SIEM being
+    # unreachable must never affect detection (see CEFSyslogExporter's
+    # own _safe_send()), so this is safe to construct even if no real
+    # SIEM is listening yet.
+    cef_config = config.get("cef", {})
+    cef_exporter = None
+    if cef_config.get("enabled", False):
+        cef_exporter = CEFSyslogExporter(
+            host=cef_config.get("host", "localhost"),
+            port=int(cef_config.get("port", 514)),
+        )
+        console.print(
+            f"[dim]CEF/SIEM export enabled — sending to "
+            f"{cef_config.get('host', 'localhost')}:{cef_config.get('port', 514)} (UDP syslog)[/dim]"
+        )
 
     # Incidents REST API — runs in the SAME process as the capture
     # loop, sharing this exact correlation_engine instance (not a copy)
@@ -367,6 +394,7 @@ def run_live_capture(config: dict) -> None:
         from api.app import create_app
 
         api_app = create_app(correlation_engine)
+        mount_metrics(api_app, metrics=metrics)
         api_host = api_config.get("host", "127.0.0.1")
         api_port = int(api_config.get("port", 8787))
         uvicorn_config = uvicorn.Config(api_app, host=api_host, port=api_port, log_level="warning")
@@ -374,6 +402,12 @@ def run_live_capture(config: dict) -> None:
         api_thread = threading.Thread(target=api_server.run, daemon=True)
         api_thread.start()
         console.print(f"[dim]Incidents API listening on http://{api_host}:{api_port} (docs at /docs)[/dim]")
+        console.print(f"[dim]Prometheus metrics at http://{api_host}:{api_port}/metrics[/dim]")
+    else:
+        console.print(
+            "[dim]api.enabled is false — Prometheus metrics are still being recorded in-process, "
+            "but /metrics has nothing to mount onto and won't be scrapeable this run.[/dim]"
+        )
 
     ddos_tracker = GlobalRateTracker(config)
     port_scan_tracker = PortScanTracker(config)
@@ -387,7 +421,10 @@ def run_live_capture(config: dict) -> None:
     detector = AnomalyDetector(config)
     logger = DetectionLogger(config)
     llm_analyser = LLMAnalyser(config)
-    labeller = Labeller(config, llm_analyser=llm_analyser, evidence_buffer=evidence_buffer, correlation_engine=correlation_engine)
+    labeller = Labeller(
+        config, llm_analyser=llm_analyser, evidence_buffer=evidence_buffer,
+        correlation_engine=correlation_engine, metrics=metrics, cef_exporter=cef_exporter,
+    )
 
     # Phase 3: GeoIP enrichment, alerting, and auto-blocking — one
     # shared stack for the whole pipeline. See build_response_stack().
@@ -697,6 +734,8 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     )
     from detection.correlation_engine import CorrelationEngine
     from pipeline.labeller import Labeller
+    from observability.metrics import get_metrics
+    from observability.cef_export import CEFSyslogExporter
 
     print_banner(config, mode=f"pcap replay — {pcap_path}")
 
@@ -708,6 +747,20 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     # pending DB-persist TODO.
     evidence_buffer = EvidenceBuffer(config.get("evidence", {}).get("buffer_window_seconds", 300.0))
     correlation_engine = CorrelationEngine()
+
+    # Metrics/CEF export are wired identically to run_live_capture, so
+    # replaying a pcap is also a way to exercise/verify the observability
+    # pipeline end-to-end against known traffic — no separate API server
+    # is started here, though, since pcap replay is an offline, one-shot
+    # run rather than something you'd point a Prometheus scrape config at.
+    metrics = get_metrics()
+    cef_config = config.get("cef", {})
+    cef_exporter = None
+    if cef_config.get("enabled", False):
+        cef_exporter = CEFSyslogExporter(
+            host=cef_config.get("host", "localhost"),
+            port=int(cef_config.get("port", 514)),
+        )
 
     ddos_tracker = GlobalRateTracker(config)
     port_scan_tracker = PortScanTracker(config)
@@ -722,7 +775,10 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     detector = AnomalyDetector(config)
     logger = DetectionLogger(config)
     llm_analyser = LLMAnalyser(config)
-    labeller = Labeller(config, llm_analyser=llm_analyser, evidence_buffer=evidence_buffer, correlation_engine=correlation_engine)
+    labeller = Labeller(
+        config, llm_analyser=llm_analyser, evidence_buffer=evidence_buffer,
+        correlation_engine=correlation_engine, metrics=metrics, cef_exporter=cef_exporter,
+    )
     classifier = try_train_classifier(config)
 
     # Phase 3 response stack — same wiring as run_live_capture. Replay
