@@ -322,8 +322,44 @@ models:
   keep_versions: 5
 
 # ------------------------------------------------------------
+# Incidents API (api/app.py) — the REST API main.py actually starts
+# alongside live capture (see run_live_capture's api_config block).
+# ------------------------------------------------------------
+# NOTE (added during the observability wiring pass): this section was
+# missing from config.yaml even though main.py already reads it —
+# it was silently falling back to enabled=True, host=127.0.0.1,
+# port=8787 every run. Adding it explicitly here rather than leaving
+# it undocumented. The `dashboard:` section below this one, with a
+# DIFFERENT port (8000) and an api_key field nothing currently reads,
+# looks like a stale leftover from before api/app.py existed — flagged
+# rather than silently deleted, since it's not this pass's call to
+# remove something that might still be intentional. Worth confirming
+# whether `dashboard:` is dead and safe to delete.
+api:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8787
+
+# ------------------------------------------------------------
+# SIEM export (CEF over syslog) — observability/cef_export.py.
+# Off by default: most deployments don't have a SIEM listener to send
+# to yet, and CEFSyslogExporter's own _safe_send() already guarantees
+# a missing/unreachable listener never affects detection either way,
+# but there's no reason to even attempt UDP sends with nothing on the
+# other end.
+# ------------------------------------------------------------
+cef:
+  enabled: false
+  host: "localhost"
+  port: 514
+
+# ------------------------------------------------------------
 # Dashboard / API settings
 # ------------------------------------------------------------
+# NOT currently read by any reviewed code — api/app.py and main.py
+# both use the `api:` section above instead. Likely a stale leftover
+# from before api/app.py existed. Left in place rather than deleted,
+# pending confirmation that nothing else still depends on it.
 dashboard:
   # Port the FastAPI backend listens on.
   api_port: 8000
