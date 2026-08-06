@@ -19,7 +19,8 @@
 | 1 | Foundation | Packet capture + feature extraction + anomaly/flood/DDoS detection (CLI) | Project 1 | ✅ Complete — 43 passing tests |
 | 2 | Intelligence | Supervised ML + LLM log analysis + self-labelling pipeline + port-scan detection | Project 1 v2 | ✅ Complete — 99 passing tests, 72%+ coverage (verified end-to-end on real nmap scans, real floods, real DDoS traffic) — tagged `v2.0-supervised-learning` |
 | 3 | Response | Auto-blocking (nftables/iptables) + GeoIP + alerting | Project 2 | ✅ Complete — all real-hardware gaps closed (webhook delivery, real nftables block + expiry, iptables fallback, DDoS alert-only branch verified via deterministic synthetic pcap), 153 passing tests total |
-| 4 | Dashboard | Live web dashboard with world map + real-time feed | Project 2 v2 | Not started |
+| 3.5 | Enterprise Readiness | Evidence/Incident/Risk fusion, MITRE ATT&CK tagging, observability (Prometheus metrics, CEF/SIEM export, structured JSON-lines logging), incident reporting (CSV/Markdown), incidents REST API, plus design docs for multi-sensor deployment / DB retention / secrets hardening | Project 2 v1.5 | ✅ Complete — code + tests; three items are design docs only, not yet implemented (see Phase 3.5 below) |
+| 4 | Dashboard | Terminal UI (Textual) + native desktop app, both sitting on the Phase 3.5 incidents API — no browser dashboard | Project 2 v2 | Design doc complete (`docs/phase4_dashboard_architecture.md`) — build not started |
 | 5 | Production | Auto-retraining pipeline + model versioning + hardening | Project 3 | Not started |
 | 6 | Extras | Ideas to add during development (add freely) | — | Ongoing |
 
@@ -398,9 +399,102 @@ Two additional bugs were found and fixed during Phase 3 live testing: (a) the cl
 
 ---
 
+## Phase 3.5 — Enterprise Readiness
+
+**Goal:** every detector already worked, but their outputs never talked to each other — five ad-hoc shapes, no shared incident concept, no fused risk score, no way for a SOC's existing tooling (SIEM, Prometheus) to plug in. This phase fixes that layer without touching detection logic itself.
+
+**Why this became its own phase instead of folding into Phase 4:** the dashboard (Phase 4) needs fused, correlated, risk-scored incidents to actually show anything useful — building it against five raw detector outputs would mean redoing this work later anyway. Doing it first meant Phase 4 could be scoped against a real API instead of a hypothetical one.
+
+### 3.5.1 — Foundational fusion layer ✅ Complete
+
+- [x] **Universal Evidence Object** (`detection/evidence.py`) — every detector (`anomaly`, `ddos_tracker`, `port_scan_tracker`, `brute_force_tracker`, `llm_analyser`) now normalises into one common `Evidence` shape (detector, src/dst IP+port, timestamp, verdict, reasoning, payload) instead of five different ad-hoc result objects. Was the Phase 6 backlog's top foundational item — everything below depends on it.
+- [x] **Incident Correlation Engine** (`detection/correlation_engine.py`) — groups Evidence by `src_ip` into `Incident` objects instead of N separate alerts per source. Explicit product decisions made and documented in the module itself: incidents group on `src_ip` alone (not dst, so a multi-stage attack against different hosts from one source still reads as one story); incidents never auto-close (silence isn't evidence of resolution — a human must call `resolve()`); only SUSPICIOUS/ATTACK evidence opens or updates an incident (NORMAL/WARMING_UP would swamp real incidents in noise); ddos evidence (no single src_ip) gets one dedicated always-open `AGGREGATE_KEY` bucket since there's no single attacker to attribute it to.
+- [x] **Unified Risk Engine** (`detection/risk_engine.py`) — fuses an incident's evidence into one 0–100 score + LOW/MEDIUM/HIGH/CRITICAL tier, instead of an operator mentally combining five verdicts themselves. Weights each detector by trust (deterministic trackers 1.0, anomaly 0.5 since it's a statistical guess, llm 1.2 as Sentinel's highest-confidence signal elsewhere too) plus a corroboration bonus per additional distinct detector agreeing on the same source. **Known, documented limitation, not silently assumed away:** the correlation engine already discards NORMAL LLM verdicts before they ever reach an incident, so this engine has no counter-evidence to weigh against an existing ATTACK finding — score only ever accumulates upward. Fixing that means changing what the correlation engine attaches, not this engine's fusion math.
+- [x] **Detection Timeline** (`detection/timeline.py`) — thin presentation layer over `Incident.evidence` (already chronological by arrival order, deliberately not re-sorted by timestamp — arrival order is what Sentinel actually observed and acted on). One shared, tested rendering path instead of every future caller (CLI, dashboard, reports) re-implementing "walk the evidence and format it" slightly differently.
+
+### 3.5.2 — MITRE ATT&CK tagging ✅ Complete
+
+- [x] `detection/mitre_attack.py` — maps each detector's finding onto a best-effort MITRE ATT&CK technique. Fixed 1:1 mappings for the three deterministic trackers (`ddos`→T1498, `port_scan`→T1046, `brute_force`→T1110); `anomaly` deliberately gets NO tag (a statistical outlier score doesn't know *what* is anomalous, so tagging it would be inventing a claim the detector never made); `llm` is mapped off its own `attack_type` payload field rather than off detector name, since one LLM call can name any of several attack types. `get_techniques_for_incident()` returns the deduplicated union across all evidence on an incident, so a multi-stage attack surfaces every technique involved, not just the latest one. Lost the original file in an unrelated environment issue and rebuilt it from the design notes — 16 tests, all passing.
+
+### 3.5.3 — Observability ✅ Complete
+
+- [x] **Structured event logging** (`observability/structured_logger.py`) — JSON-lines, one event per line (`evidence_created`, `incident_opened`/`incident_updated`), trivially parseable by any log shipper without Sentinel needing to know anything about the consumer. Lives in its own top-level package since it's a genuine cross-cutting concern touched by `correlation_engine.py`, `labeller.py`, and eventually `response/`.
+- [x] **Prometheus metrics** (`observability/metrics.py`) — counters/gauges/histograms for evidence, flows, incidents (opened/updated/currently-open), fused risk scores, block actions, LLM call outcomes, CEF export outcomes. All labels deliberately low-cardinality (detector, verdict, tier — never a raw IP), so `/metrics` stays cheap to scrape at any real scale. Mounts onto the SAME FastAPI app the incidents API already runs (`mount_metrics(app)`), rather than a second server on a second port. 14 tests, plus an end-to-end check that `/metrics` is actually scrapeable once mounted.
+- [x] **CEF/SIEM export** (`observability/cef_export.py`) — renders Evidence and Incidents as CEF (Common Event Format) strings and ships them over syslog, so Sentinel's findings show up natively in a real SOC's existing SIEM instead of requiring a Sentinel-specific integration. Two granularities: per-evidence (raw signal, deeper forensics) and per-incident (fused, the primary feed most deployments would actually want). Incident-level CEF lines carry the MITRE technique IDs too (`cs3=T1046,T1110`) — this is the actual connective tissue between 3.5.2 and 3.5.3, not two disconnected features.
+
+### 3.5.4 — Reporting ✅ Complete
+
+- [x] `reporting/incident_report.py` — CSV export at two granularities (one row per incident, or one row per evidence item for forensic detail) and Markdown case-file reports (single-incident deep-dive, or a fleet-wide summary table sorted by risk descending). Deliberately Markdown, not PDF — no new heavy dependency, renders cleanly anywhere, converts to PDF trivially with `pandoc` if a specific handoff ever needs one. Real bug found and fixed: was importing `techniques_for_incident` from `mitre_attack.py`, which actually exports `get_techniques_for_incident` — would have crashed on first real use, caught before it shipped.
+
+### 3.5.5 — Incidents REST API ✅ Complete (built ahead of the dashboard, on purpose)
+
+- [x] `api/app.py` — `GET /incidents` (open by default, `?include_resolved=true` for full history), `GET /incidents/{key}` (full detail incl. timeline), `POST /incidents/{key}/resolve`, `POST /incidents/{key}/reopen`. Takes its `CorrelationEngine` as a constructor argument rather than a global, so it's testable in isolation and so there's exactly one engine instance shared between the capture loop and the API — never a second, silently-empty copy. Built deliberately BEFORE the dashboard, specifically so the dashboard is a client of a real, already-tested API from day one instead of something built against direct DB access that gets redone once an API exists anyway.
+- [x] Wired into `main.py`: runs in a background thread in the SAME process as the capture loop (both `run_live_capture` and `run_pcap`), sharing the live `correlation_engine` object directly — not a separate process reading a stale snapshot. Config-driven (`api.enabled`/`api.host`/`api.port`, default `127.0.0.1:8787`).
+- [x] ~~**API authentication — still not implemented.** Every route, including the two ACTION routes (`resolve`/`reopen`), is currently open to anyone who can reach the port.~~ — DONE: static per-deployment key (`SENTINEL_API_KEY` in `.env`, never in config), checked via `api/auth.py`'s `require_api_key` FastAPI dependency, applied to every route except `/health`. Config-driven via `api.require_auth` (default true). `main.py` passes `require_auth=api_config.get("require_auth", True)` into `create_app()`. Tests in `tests/test_api_auth.py`.
+  - **Real bug found and fixed in the same pass:** `main.py` was importing `from api.app import create_app`, but the file was actually named `api/api.py` (also missing `api/__init__.py`) — this would have crashed with `ModuleNotFoundError` the moment `api.enabled: true` hit live capture (the default). Zero test coverage on the API module meant this was never caught. Renamed `api/api.py` → `api/app.py` to match what every docstring already called it, added the missing `__init__.py`.
+
+### 3.5.6 — Consolidated wiring pass ✅ Complete
+
+Everything above was built and tested standalone first (matching how Phase 1–3 modules were each proven before wiring), then tied together through the ONE call site everything else already funnelled through: `Labeller.store_evidence()`. That single method now does, per Evidence: persists to DB (unchanged), files into the correlation engine (unchanged), logs structured events (already wired), AND ALSO records Prometheus metrics, computes the incident's fused risk + MITRE techniques, and pushes both evidence- and incident-level CEF lines if a SIEM exporter is configured — all four observability outputs from one place, none of them able to silently drift out of sync with what actually happened.
+
+- [x] `Labeller.__init__` gained optional `metrics`/`cef_exporter` params — optional and no-op by default, so the two read-only Labeller instances (`try_train_classifier()`, `run_label()`) don't need to change at all.
+- [x] `main.py`'s `run_live_capture`/`run_pcap` both construct the shared `SentinelMetrics` singleton and an optional `CEFSyslogExporter` (config-driven, off by default), and `mount_metrics()` onto the same app the incidents API runs.
+- [x] **Real config bug found and fixed:** `config.yaml` had no `api:` section at all, even though `main.py` already read `config.get("api", {})` — it had been silently falling back to undocumented defaults every run. Added the section explicitly, plus a new `cef:` section. Flagged (not deleted) an old `dashboard:` block with a DIFFERENT port and an `api_key` field nothing reads — looks like a stale leftover from before `api/app.py` existed.
+- [x] Verified end-to-end with a real smoke test, not just import-checked: a genuine `Evidence` object through `store_evidence()` correctly opened an incident, recorded metrics, computed risk, and a separate check confirmed `incident_to_cef()` actually emits the MITRE technique ID in its output line.
+
+### 3.5.7 — Secrets & hardening review ✅ Complete (partial scope, honestly labelled)
+
+- [x] `docs/secrets_hardening_review.md` — reviewed every file available at review time. Findings: LLM API keys correctly sourced from env vars (confirm `.env` git-hygiene as a follow-up); `api/app.py` has zero auth (see 3.5.5); CEF syslog export is plaintext UDP by default (document as a deployment constraint, not a bug); GeoIP's `"api"` method sends every resolved attacker IP to `ip-api.com` over plain HTTP (second reason, beyond rate limits, to prefer the offline `maxmind` method for real deployments).
+- [x] `response/blocker.py` reviewed in full once uploaded — **clean.** Every subprocess call is list-form (`shell=True` never used), and every `block()`/`unblock()` runs through `_check_skip()`'s `ipaddress.ip_address()` validation before an IP string can ever reach a backend command. No injection risk found.
+- [ ] `pipeline/labeller.py`'s DB schema, `main.py`'s full flow (beyond the API-mounting section), and a dependency-level CVE scan (`pip-audit`/`safety`) were explicitly out of scope for this pass — noted as unreviewed rather than assumed safe.
+
+### 3.5.8 — Design docs (proposals, not yet implemented) ✅ Written
+
+- [x] `docs/multi_sensor_architecture.md` — recommends a central aggregator that POLLS each sensor's existing `/incidents` API (buildable almost entirely from code that already exists, keeps every sensor fully autonomous if it loses contact with the center) over sensors PUSHING raw Evidence to a central correlation engine (real-time and enables cross-sensor correlation, but needs a new durable local queue, a new ingestion protocol, and an untested second `CorrelationEngine` at scale — deliberately deferred as a future upgrade, not abandoned).
+- [x] `docs/db_retention_policy.md` — SQLite currently has no rotation story at all (the exact class of problem that lost 706+ training samples in an unrelated reinstall). Proposes two very different tiers: resolved-incident evidence (90-day default, deletable) vs. classifier training samples (size-capped PER CLASS, never time-capped, so retention can't undercut the organic-accumulation strategy). Evidence behind a still-OPEN incident is never touched by an automated policy — ties directly to 3.5.1's "incidents never auto-close" rule. Explicitly blocked on reading the real DB schema before any deletion SQL gets written.
+- [x] `docs/secrets_hardening_review.md` — see 3.5.7.
+
+**Current total: 153 pre-existing tests, +16 (`test_mitre_attack.py`) +14 (`test_metrics.py`) = 183+ verified this phase.** (Not a re-run of the full project suite — the full dependency set wasn't available every session this phase; each new test file was run and confirmed green against the real modules it tests, not just import-checked.)
+
+---
+
 ## Phase 4 — Dashboard
 
-**Goal:** Replace the CLI table with a live web dashboard. Real-time attack feed, world map showing attacker origins, blocked IP management, model performance metrics — all in one place.
+**Goal:** replace the CLI table with something that shows fused, correlated incidents at a glance — not a raw flow feed. **Design doc:** `docs/phase4_dashboard_architecture.md`.
+
+**Decision that supersedes the original plan below:** no browser-based web dashboard. Two front-ends instead — a richer terminal UI for anyone comfortable on a terminal, and a genuine native desktop app (not a browser tab) for anyone who isn't — both sitting on top of the incidents API that Phase 3.5 already built and tested (`api/app.py`, plus `/metrics`). Neither front-end needs its own detection logic, risk scoring, or MITRE mapping — that layer is already correct and already tested; both front-ends are pure consumers of it. The original 4.1/4.2 plan below (Streamlit/React, world map, WebSocket) is kept for reference but is superseded by 4.1'/4.2'/4.3' underneath it.
+
+### 4.0' — Backend API — mostly already done in Phase 3.5
+
+- [x] REST API exists and is wired into `main.py` (`api/app.py`, Phase 3.5.5) — `/incidents`, `/incidents/{key}`, resolve/reopen, `/metrics`.
+- [ ] **API key authentication — hard prerequisite for the native app track (4.2'), not optional.** The TUI doesn't need this (runs in-process, no HTTP hop) but the native app talks to `api/app.py` over real HTTP.
+- [ ] New lightweight `/summary` endpoint (open incident count, risk tier breakdown, currently-blocked IP count) so a dashboard's top-level view doesn't have to fetch and locally aggregate every incident just for a few numbers.
+
+### 4.1' — Terminal UI (build this first)
+
+- [ ] New `detection/tui_dashboard.py`, built with **Textual** (same team as `rich`, already a dependency) — NOT an extension of `cli_display.py`, a separate panelled view. `cli_display.py`'s existing flat scrolling log is genuinely the right tool for "what's happening right now, scroll back through it" (its own docstring documents why an earlier `rich.Live` table version was wrong for that job) — a panelled "current state of all open incidents" view is a different, complementary job, not a v2 of the same one.
+- [ ] Multi-pane layout: open-incidents list (risk tier, detectors involved) + selected-incident detail (risk score, MITRE techniques, scrollable timeline via `detection/timeline.py`) + the existing scrolling flow log embedded as one pane.
+- [ ] Runs in-process with `main.py` — reads `correlation_engine`/`risk_engine`/`mitre_attack` directly, no HTTP round-trip to its own API needed.
+- [ ] Resolve/reopen as real keybindings (`r`/`o`) calling `correlation_engine.resolve()`/`.reopen()` directly.
+- [ ] `--dashboard`/`--classic` flag (or config option) to choose between today's flat log and the new panelled view — the flat log stays useful for piping to `less`/`grep`, which a panelled TUI can't do.
+
+### 4.2' — Native desktop app (after 4.0'/4.1', biggest single piece of new work)
+
+Two real options, deliberately not resolved in the design doc since it's a values call, not a technical one:
+
+- [ ] **Option A — Tauri** (Rust shell + web-tech UI, packaged as a real small native binary using the OS's own webview). Genuinely native, small, fast. Doubles as direct Rust practice that compounds with MAVIS. Adds a second language/toolchain to Sentinel specifically.
+- [ ] **Option B — PySide6** (native Qt widgets via Python bindings). Stays single-language with the rest of Sentinel. No overlap with MAVIS/Rust. More manual work to get rich charting/layout to the same polish level web tooling gets for free.
+- [ ] Whichever is picked: talks to `api/app.py` over HTTP as a genuinely separate process (unlike the TUI) — this is what makes 4.0's API-key work a hard blocker, not a nice-to-have.
+- [ ] Open question, not yet decided: should the app be able to run standalone bundled with its own sensor, or always be a thin client pointed at a running sensor/aggregator's API? Leaning toward always-a-client, so the same app works against either a single sensor or the future multi-sensor aggregator (`docs/multi_sensor_architecture.md`) without caring which.
+
+### 4.3' — Phase 4 wrap-up
+
+- [ ] Screenshots/recording of both front-ends for the README and CV
+- [ ] Tag: `git tag v4.0-dashboard`
+- [ ] This is **Portfolio Project 2 — v2**
+
+<details>
+<summary>Original Phase 4 plan (web dashboard) — superseded, kept for reference</summary>
 
 ### 4.1 — Backend API (`dashboard/api.py`)
 
@@ -457,6 +551,8 @@ Two additional bugs were found and fixed during Phase 3 live testing: (a) the cl
 - [ ] Tag: `git tag v4.0-dashboard`
 - [ ] Update GitHub with screenshots in the README — visual projects get far more attention than text-only repos
 - [ ] This is **Portfolio Project 2 — v2**
+
+</details>
 
 ---
 
@@ -561,30 +657,30 @@ Two additional bugs were found and fixed during Phase 3 live testing: (a) the cl
   - **Same-host traffic hairpins regardless of address used** — not just `127.0.0.1`. Sending traffic from a machine to its OWN real LAN IP also gets short-circuited by the kernel before reaching Scapy's capture layer. Any attack simulation, including port-scan testing, must originate from a genuinely separate network namespace (a Docker container is sufficient) to be captured at all.
   - When generating high-packet-rate test traffic, use a single persistent socket with real per-packet `sendto()`/`send()` calls in a loop — piping input through `nc` (`seq | nc -u`) buffers into a small number of large datagrams, and spawning a new process per packet (`for i in ...; do nc ...; done`) creates a new ephemeral source port each time, splitting one intended flood into hundreds of tiny separate flows. Neither produces traffic that per-flow or aggregate detectors can correctly recognise.
   - **LLM SDK clients retry by default:** both the OpenAI-compatible (NVIDIA NIM) and Anthropic Python SDKs retry failed/timed-out requests automatically (`max_retries=2` typically) unless told not to. A configured `timeout=` alone does not prevent this from silently multiplying total call duration — pass `max_retries=0` explicitly if a hard, predictable timeout matters (as it does here, since `analyse()` is called synchronously from the main capture loop).
-- [ ] **Decoy / honeypot port:** open a port that no real service listens on — any connection to it is automatically flagged as a scan
-- [ ] **P2P threat sharing:** share blocked IP lists with other instances of the system (useful if you deploy it on multiple machines)
+- [x] ~~**Decoy / honeypot port:** open a port that no real service listens on — any connection to it is automatically flagged as a scan~~ — EXPANDED, not yet built: idea grew from "flag any connection" into a real trap — a fake listening service on an unused port that engages just enough to capture attacker behaviour (commands attempted, credentials tried, tooling fingerprint) before feeding it into the existing `Evidence`/`CorrelationEngine` pipeline as a new `DetectorName.HONEYPOT` source. Structurally different from every other detector built so far: everything else is PASSIVE (observes real traffic and reacts); a honeypot is ACTIVE (exposes a fake service and waits to be touched) — new attack surface, real isolation/containment requirements (a honeypot that gets genuinely compromised is worse than not having one), and a new data pipeline. Deserves its own design doc before building, same as the multi-sensor/retention/hardening items got in Phase 3.5 — not started yet.
+- [ ] **P2P threat sharing:** share blocked IP lists with other instances of the system (useful if you deploy it on multiple machines) — see `docs/multi_sensor_architecture.md` for the related, more fleshed-out multi-sensor aggregator design (Option A: poll-based) — this P2P idea is a different, more decentralized shape than that design and hasn't been reconciled with it yet.
 - [ ] **Browser extension:** show a warning badge when you visit an IP that your system has previously flagged
 - [ ] **Mobile push notifications:** send alerts to your phone via Pushover or ntfy.sh (both free)
 - [ ] **Packet payload analysis (optional, careful):** for unencrypted protocols, scan payload for known attack signatures (SQL injection strings, shell commands) — clearly document the privacy implications
 - [ ] **VPN/Tor detection:** flag flows from known Tor exit nodes or VPN providers (use public IP lists)
 - [ ] **Protocol anomaly detection:** flag HTTP requests with unusual methods, oversized headers, or malformed structure
-- [ ] **MITRE ATT&CK mapping:** tag each detected attack type with its MITRE ATT&CK technique ID (e.g. T1046 for port scanning) — adds serious credibility to the project
-- [ ] **Export report:** generate a PDF summary of the week's attack activity — useful for the portfolio and for showing to a potential employer
+- [x] ~~**MITRE ATT&CK mapping:** tag each detected attack type with its MITRE ATT&CK technique ID (e.g. T1046 for port scanning) — adds serious credibility to the project~~ — DONE, see Phase 3.5.2 (`detection/mitre_attack.py`).
+- [x] **Export report:** generate a PDF summary of the week's attack activity — DONE as Markdown instead of PDF (deliberate — see Phase 3.5.4's reasoning), see `reporting/incident_report.py`. Converts to PDF trivially via `pandoc` if a specific handoff ever needs one.
 
 ### 2026-07-23 — Big list of ideas (logged, not started)
 
 Got a huge list of SIEM/SOAR-style ideas I want to eventually fold in. Logging them here organized by fit rather than committing any of it to a phase yet. Brute-force tracker is done now (see above), and before touching any of this, doing a full verification pass first — classifier re-check, general system review. None of the below has been started. Same rule as always for this batch: extend what Sentinel already does, don't turn it into a different product.
 
 **Foundational — do these first if this batch gets picked up, since everything else below depends on them:**
-- [ ] **Universal Evidence Object** — every detector (`port_scan_tracker`, `ddos_tracker`, classifier, LLM analyser) currently returns its own ad-hoc shape. Define one common object (detector name, src/dst IP+port, protocol, timestamp, severity, confidence, risk score, feature values, GeoIP, recommendation, tags) that every module emits and everything downstream (logging, alerting, future dashboard) consumes. Cheapest to do now, before Phase 4/5 build more on top of today's inconsistent shapes.
-- [ ] **Incident Correlation Engine** — group related Evidence Objects (port scan + DDoS + GeoIP + block action against the same source/timeframe) into one incident instead of N separate alerts. Depends on the Evidence Object existing first. Highest-leverage item in the whole list.
-- [ ] **Unified Risk Engine / Confidence Fusion** — combine per-detector confidence (ML, port-scan, DDoS, GeoIP reputation) into one risk score per incident, rather than each detector deciding independently. Depends on the above two.
-- [ ] **Detection timeline per incident** — natural once incidents exist; mostly a query/formatting layer over existing timestamped Evidence Objects.
+- [x] ~~**Universal Evidence Object**~~ — DONE, see Phase 3.5.1.
+- [x] ~~**Incident Correlation Engine**~~ — DONE, see Phase 3.5.1.
+- [x] ~~**Unified Risk Engine / Confidence Fusion**~~ — DONE, see Phase 3.5.1.
+- [x] ~~**Detection timeline per incident**~~ — DONE, see Phase 3.5.1.
 
 **Natural extensions of existing trackers — buildable without new subsystems:**
 - [ ] **Distributed scan detection** — many source IPs, each scanning few ports, against the same victim, correlated as one coordinated attack. Extends `port_scan_tracker.py`'s existing vertical/horizontal fan-out logic to a third axis (many-sources-one-victim) rather than requiring a new detector.
 - [ ] **Slow scan detection** — scans spread over minutes/hours/days instead of only within the current sliding window. Requires a longer-lived, lower-resolution tracking table alongside the existing fast sliding window.
-- [ ] **Scan speed/duration/severity/confidence display** — mostly exposing numbers (ports/sec, start/end/duration, a confidence percentage) the port-scan tracker already computes internally but doesn't currently surface.
+- [x] ~~**Scan speed/duration/severity/confidence display**~~ — DONE: `PortScanCheckResult` now carries `scan_start_timestamp`, `scan_end_timestamp`, `duration_seconds`, `ports_per_second`, `confidence_pct`, computed from data the tracker already tracked internally — no new tracking added. Confidence scales against the ATTACK threshold specifically, capped at 100%, 0 for NORMAL.
 - [ ] **DDoS attack-type breakdown** (SYN/ACK/UDP/ICMP/HTTP/HTTPS flood, DNS amplification, reflection) — extends the existing `ddos_tracker` to classify by flag/protocol pattern rather than only detecting volume.
 - [ ] **Multi-window DDoS analysis** (5s/30s/1min/5min/30min simultaneously) and **entropy analysis** (source/dest IP, dest port, protocol entropy) — both are statistically well-scoped additions to the existing aggregate tracker.
 - [ ] **Adaptive baselines** — replace fixed thresholds (e.g. flood-rate guard's static packets/sec) with a learned per-network baseline. Directly addresses the still-open flood/bursty-legitimate-traffic separability problem — likely higher value than adding `iat_cv` alone.
@@ -592,15 +688,18 @@ Got a huge list of SIEM/SOAR-style ideas I want to eventually fold in. Logging t
 
 **Explicitly separate future projects, not Sentinel features** (would blur Sentinel's flow-metadata-only story if folded in):
 - [ ] Threat Intelligence module (AbuseIPDB, VirusTotal, GreyNoise, AlienVault OTX, Spamhaus, WHOIS/ASN) — a legitimate API-integration project, but a different one from Sentinel's from-scratch-detection story
-- [ ] Plugin system, REST API, multi-sensor deployment, central management console, RBAC — this is "Sentinel becomes a distributed product," a v2.0 rewrite rather than an addition
+- [x] ~~Plugin system, REST API, multi-sensor deployment, central management console, RBAC~~ — REST API done (Phase 3.5.5, `api/app.py`, built ahead of schedule specifically because the dashboard needed it). Multi-sensor deployment now has a real design doc (`docs/multi_sensor_architecture.md`) rather than being ruled out — reclassified from "not Sentinel" to "a real future phase," since it turned out to be additive (a new `aggregator/` package polling existing per-sensor APIs) rather than the rewrite this line originally assumed. Central management console/RBAC remain out of scope for now — RBAC in particular doesn't matter until the API has ANY auth at all (see Phase 3.5.5's open item).
 - [ ] Packet payload analysis, HTTP/TLS (JA3/JA4) fingerprinting, DNS tunneling/DGA detection — real detection value, but payload/protocol inspection is a meaningfully different architecture from today's flow-metadata-only design; worth its own project (ties back to the WAF idea already discussed for a possible project #2)
 
 **Smaller, low-risk items worth doing whenever convenient (no architectural dependency):**
 - [ ] Explainable AI (SHAP/LIME) + model versioning + dataset metadata (training date, precision/recall/F1, git commit) for the classifier — genuinely good practice, doable independent of everything else here
 - [ ] Config validation, config versioning, default profiles (Home/Lab/Office/Enterprise), runtime config reload
-- [ ] MITRE ATT&CK technique tagging per detected attack type (e.g. T1046 for port scanning) — cheap, adds real portfolio credibility
+- [x] ~~MITRE ATT&CK technique tagging per detected attack type~~ — DONE, see Phase 3.5.2.
 - [ ] IPv6 support, protocol identification (HTTP/DNS/SSH/SMTP/etc. instead of only TCP/UDP)
 - [ ] Concept drift detection + false-positive-driven auto-retraining loop (user marks a detection as false positive → sample stored → included in next retrain)
+- [x] ~~**DB retention/rotation — design done, not implemented.**~~ — DONE, see `pipeline/retention.py`. Implemented against the real schema (`pipeline/labeller.py`'s `evidence`/`labelled_flows` tables), not the inferred names in the original design doc. Key finding while implementing: incidents are in-memory only, never persisted with a resolved-at timestamp — "90 days after resolution" is approximated as "90 days old AND no currently-open incident for that src_ip", which preserves the actual safety property (never delete evidence an active investigation needs) without a real resolution timestamp to anchor to. Three tiers (bulk NORMAL/WARMING_UP evidence, resolved-incident findings, training-sample size cap), batched deletes, interval-gated VACUUM. Wired into both `run_live_capture` and `run_pcap` via `retention.maybe_run(display.total_flows_seen)`, mirroring `cli_display.py`'s own periodic-summary pattern. Tests in `tests/test_retention.py`.
+- [x] ~~**API authentication — design decided (static per-deployment key), not implemented.**~~ — DONE, see above (top of this Phase 6 list).
+- [ ] **Honeypot** — see expanded entry above (this section, "Decoy/honeypot port"). Needs its own design doc before building.
 
 
 

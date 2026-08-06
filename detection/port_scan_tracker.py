@@ -106,12 +106,35 @@ class PortScanCheckResult:
     distinct_ports_in_window: int
     distinct_targets_in_window: int
 
+    # Added for dashboard surfacing: these were previously computed
+    # internally (implicitly, via the entries deque) but never
+    # returned - a dashboard's incident/scan detail view needs actual
+    # numbers to show, not just a verdict string. See PHASES.md Phase
+    # 6, "Scan speed/duration/severity/confidence display".
+    #
+    # Defaulted (not bare required fields) specifically so every
+    # EXISTING positional construction of this dataclass across the
+    # codebase (tests, detection/evidence.py's from_port_scan call
+    # sites written before this change) keeps working unchanged - a
+    # real regression this caused on the first pass (13 test failures)
+    # before these got defaults. New code should pass them explicitly;
+    # nothing that matters silently drops them, since check() below
+    # always fills in real computed values, not these placeholders.
+    scan_start_timestamp: float | None = None
+    scan_end_timestamp: float | None = None
+    duration_seconds: float = 0.0
+    ports_per_second: float = 0.0
+    confidence_pct: float = 0.0
+
     def __repr__(self) -> str:
         return (
             f"PortScanCheckResult(verdict={self.verdict.value}, "
             f"src_ip={self.src_ip}, "
             f"distinct_ports={self.distinct_ports_in_window}, "
-            f"distinct_targets={self.distinct_targets_in_window})"
+            f"distinct_targets={self.distinct_targets_in_window}, "
+            f"duration={self.duration_seconds:.1f}s, "
+            f"rate={self.ports_per_second:.1f} ports/s, "
+            f"confidence={self.confidence_pct:.0f}%)"
         )
 
 
@@ -202,10 +225,25 @@ class PortScanTracker:
                     window_seconds=self.window_seconds,
                     distinct_ports_in_window=0,
                     distinct_targets_in_window=0,
+                    scan_start_timestamp=None,
+                    scan_end_timestamp=None,
+                    duration_seconds=0.0,
+                    ports_per_second=0.0,
+                    confidence_pct=0.0,
                 )
 
             self._evict_old_entries(entries, current_timestamp)
             distinct_ports = len({dst_port for _, _, dst_port in entries})
+
+            # Scan window bounds - the earliest and latest timestamp
+            # of ANY entry currently in the (already-evicted) window,
+            # i.e. this source's actual activity span, not the
+            # configured window_seconds ceiling. A scan that started
+            # 3 seconds ago in a 10-second window should report a
+            # 3-second duration, not 10.
+            timestamps = [ts for ts, _, _ in entries]
+            scan_start = min(timestamps) if timestamps else None
+            scan_end = max(timestamps) if timestamps else None
 
             ports_per_target: dict[str, set[int]] = defaultdict(set)
             targets_per_port: dict[int, set[str]] = defaultdict(set)
@@ -229,12 +267,41 @@ class PortScanTracker:
         else:
             verdict = PortScanVerdict.NORMAL
 
+        # duration_seconds: real elapsed time between this source's
+        # first and last touch currently in-window. A burst that all
+        # lands in the same instant (duration 0) would otherwise
+        # divide-by-zero below - floor it at a small epsilon rather
+        # than reporting a nonsensical infinite rate.
+        duration_seconds = (scan_end - scan_start) if (scan_start is not None and scan_end is not None) else 0.0
+        rate_denominator = max(duration_seconds, 0.001)
+        ports_per_second = distinct_ports / rate_denominator if distinct_ports else 0.0
+
+        # confidence_pct: NORMAL is always 0 - there's nothing to be
+        # confident ABOUT yet. Once past the suspicious threshold,
+        # confidence scales linearly against how far distinct_ports
+        # has crossed the ATTACK threshold specifically (not the
+        # suspicious one) - being 1 port over "suspicious" is barely
+        # more confident than not flagged at all, whereas approaching
+        # or exceeding the ATTACK line is genuinely high-confidence.
+        # Capped at 100 rather than growing unbounded for a 1000-port
+        # scan, since past "definitely a scan" more ports doesn't mean
+        # more confident, just a bigger scan.
+        if verdict == PortScanVerdict.NORMAL:
+            confidence_pct = 0.0
+        else:
+            confidence_pct = min(100.0, (distinct_ports / self.attack_distinct_ports_threshold) * 100.0)
+
         return PortScanCheckResult(
             verdict=verdict,
             src_ip=src_ip,
             window_seconds=self.window_seconds,
             distinct_ports_in_window=distinct_ports,
             distinct_targets_in_window=distinct_targets,
+            scan_start_timestamp=scan_start,
+            scan_end_timestamp=scan_end,
+            duration_seconds=duration_seconds,
+            ports_per_second=ports_per_second,
+            confidence_pct=confidence_pct,
         )
 
     def _evict_old_entries(
