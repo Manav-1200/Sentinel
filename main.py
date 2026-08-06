@@ -342,6 +342,7 @@ def run_live_capture(config: dict) -> None:
     )
     from detection.correlation_engine import CorrelationEngine
     from pipeline.labeller import Labeller
+    from pipeline.retention import RetentionManager
     from observability.metrics import get_metrics, mount_metrics
     from observability.cef_export import CEFSyslogExporter
 
@@ -393,7 +394,7 @@ def run_live_capture(config: dict) -> None:
         import uvicorn
         from api.app import create_app
 
-        api_app = create_app(correlation_engine)
+        api_app = create_app(correlation_engine, require_auth=api_config.get("require_auth", True))
         mount_metrics(api_app, metrics=metrics)
         api_host = api_config.get("host", "127.0.0.1")
         api_port = int(api_config.get("port", 8787))
@@ -425,6 +426,16 @@ def run_live_capture(config: dict) -> None:
         config, llm_analyser=llm_analyser, evidence_buffer=evidence_buffer,
         correlation_engine=correlation_engine, metrics=metrics, cef_exporter=cef_exporter,
     )
+
+    # DB retention/rotation — see docs/db_retention_policy.md and
+    # pipeline/retention.py's module docstring. Shares this exact
+    # correlation_engine so it can check open-incident status before
+    # deleting evidence (see that module's "in-memory only incidents"
+    # note for why this must be same-process, same instance, not a
+    # separate reader). Given a chance to run periodically further
+    # down in the loop, same pattern as cli_display's own periodic
+    # summary line.
+    retention = RetentionManager(config, correlation_engine)
 
     # Phase 3: GeoIP enrichment, alerting, and auto-blocking — one
     # shared stack for the whole pipeline. See build_response_stack().
@@ -527,6 +538,14 @@ def run_live_capture(config: dict) -> None:
 
                 display.add(result, predicted_label=predicted_label)
                 logger.log(result)
+
+                # DB retention — checked on every flow, but only
+                # actually runs a maintenance pass every
+                # retention.run_every_n_flows flows (see
+                # RetentionManager.maybe_run's gate). Placed here,
+                # right after display.add() increments total_flows_seen,
+                # so the count this checks against is always current.
+                retention.maybe_run(display.total_flows_seen)
 
                 # Self-labelling: only acts on SUSPICIOUS/ATTACK verdicts
                 # (see pipeline/labeller.py) — calls the LLM analyser
@@ -734,6 +753,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
     )
     from detection.correlation_engine import CorrelationEngine
     from pipeline.labeller import Labeller
+    from pipeline.retention import RetentionManager
     from observability.metrics import get_metrics
     from observability.cef_export import CEFSyslogExporter
 
@@ -779,6 +799,14 @@ def run_pcap(config: dict, pcap_path: str) -> None:
         config, llm_analyser=llm_analyser, evidence_buffer=evidence_buffer,
         correlation_engine=correlation_engine, metrics=metrics, cef_exporter=cef_exporter,
     )
+
+    # See run_live_capture's matching comment — same retention pass,
+    # same reasoning. Wired here too (not just live capture) so a long
+    # pcap replay doesn't grow the DB unbounded either — most test
+    # pcaps are far short of run_every_n_flows and this will simply
+    # never fire for them, which is fine.
+    retention = RetentionManager(config, correlation_engine)
+
     classifier = try_train_classifier(config)
 
     # Phase 3 response stack — same wiring as run_live_capture. Replay
@@ -822,6 +850,7 @@ def run_pcap(config: dict, pcap_path: str) -> None:
 
                 display.add(result, predicted_label=predicted_label)
                 logger.log(result)
+                retention.maybe_run(display.total_flows_seen)
                 if not is_multicast_dst:
                     labeller.process(result, timestamp=flow.last_seen)
 

@@ -329,16 +329,27 @@ models:
 # missing from config.yaml even though main.py already reads it —
 # it was silently falling back to enabled=True, host=127.0.0.1,
 # port=8787 every run. Adding it explicitly here rather than leaving
-# it undocumented. The `dashboard:` section below this one, with a
-# DIFFERENT port (8000) and an api_key field nothing currently reads,
-# looks like a stale leftover from before api/app.py existed — flagged
-# rather than silently deleted, since it's not this pass's call to
-# remove something that might still be intentional. Worth confirming
-# whether `dashboard:` is dead and safe to delete.
+# it undocumented.
+#
+# The old `dashboard:` section that used to sit below this one (port
+# 8000, an api_key field nothing read) has been REMOVED — confirmed
+# dead (api/app.py and main.py only ever read this `api:` section)
+# and it violated the "credentials never in config.yaml" rule by
+# having an api_key field at all, so it wasn't just unused, it was
+# actively the wrong shape to keep around as a template for the real
+# thing below.
+#
+# require_auth: gates every /incidents route behind an X-API-Key
+# header (see api/auth.py). The key itself is NEVER set here — it
+# lives only in .env as SENTINEL_API_KEY, per the credentials rule.
+# Set require_auth to false only for local dev against a throwaway
+# test instance; main.py's real startup path should always leave
+# this true.
 api:
   enabled: true
   host: "127.0.0.1"
   port: 8787
+  require_auth: true
 
 # ------------------------------------------------------------
 # SIEM export (CEF over syslog) — observability/cef_export.py.
@@ -354,19 +365,41 @@ cef:
   port: 514
 
 # ------------------------------------------------------------
-# Dashboard / API settings
+# Database retention & rotation — pipeline/retention.py
 # ------------------------------------------------------------
-# NOT currently read by any reviewed code — api/app.py and main.py
-# both use the `api:` section above instead. Likely a stale leftover
-# from before api/app.py existed. Left in place rather than deleted,
-# pending confirmation that nothing else still depends on it.
-dashboard:
-  # Port the FastAPI backend listens on.
-  api_port: 8000
+# Implements docs/db_retention_policy.md against the real schema.
+# See pipeline/retention.py's module docstring for the full reasoning
+# (in particular: why "resolved incident" is approximated as "no
+# currently-open incident for this src_ip", since incidents are
+# in-memory only and never persisted with a resolved-at timestamp).
+retention:
+  enabled: true
 
-  # Set a long random string here (or in .env: SENTINEL_API_KEY).
-  # All dashboard API requests must include this key.
-  api_key: ""
+  # How many flows between retention passes (checked every flow via
+  # RetentionManager.maybe_run(), same pattern as cli_display.py's
+  # own periodic summary line — see _SUMMARY_EVERY_N_FLOWS there).
+  run_every_n_flows: 5000
 
-  # How many recent flows to return from /api/flows/recent.
-  recent_flows_limit: 100
+  # NORMAL/WARMING_UP evidence older than this many days is deleted —
+  # this is the bulk, low-value-per-row tier (every flow gets an
+  # evidence row via from_anomaly(), not just flagged ones).
+  normal_evidence_days: 7
+
+  # SUSPICIOUS/ATTACK/UNAVAILABLE evidence older than this many days
+  # is deleted, UNLESS its source IP currently has an open incident.
+  resolved_incident_evidence_days: 90
+
+  # Per-label cap on labelled_flows (classifier training data).
+  # Oldest-first eviction once a label goes OVER this count — labels
+  # under the cap are never touched regardless of age (see
+  # db_retention_policy.md's "why a size cap, not a time cap").
+  max_training_samples_per_class: 5000
+
+  # How many rows per DELETE batch — keeps any single delete from
+  # holding a lock long enough to stall the live capture loop writing
+  # to the same SQLite file.
+  batch_size: 500
+
+  # Minimum hours between VACUUM passes (reclaims space DELETE alone
+  # leaves behind — rewrites the whole file, so it's deliberately rare).
+  vacuum_interval_hours: 24
