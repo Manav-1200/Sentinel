@@ -53,7 +53,7 @@ from pydantic import BaseModel
 
 from api.auth import require_auth_dependency
 from detection.correlation_engine import CorrelationEngine, IncidentStatus
-from detection.risk_engine import assess as assess_risk
+from detection.risk_engine import assess as assess_risk, RiskTier
 from detection.timeline import build_timeline
 
 
@@ -102,6 +102,17 @@ class ActionResult(BaseModel):
     status: str
 
 
+class SummaryOut(BaseModel):
+    """Shape for GET /summary - a dashboard's top-level headline
+    numbers in one call, instead of fetching and locally aggregating
+    every incident just to show three counts. See PHASES.md Phase
+    4.1' - built specifically so detection/tui_dashboard.py's top
+    panel doesn't need incident-list-shaped data at all."""
+    open_incident_count: int
+    risk_tier_breakdown: dict[str, int]
+    blocked_ip_count: int
+
+
 def _to_summary(incident, risk) -> IncidentSummaryOut:
     return IncidentSummaryOut(
         incident_id=incident.incident_id,
@@ -120,7 +131,11 @@ def _to_summary(incident, risk) -> IncidentSummaryOut:
     )
 
 
-def create_app(correlation_engine: CorrelationEngine, require_auth: bool = True) -> FastAPI:
+def create_app(
+    correlation_engine: CorrelationEngine,
+    require_auth: bool = True,
+    blocker: object = None,
+) -> FastAPI:
     """
     Builds the FastAPI app wired to a specific CorrelationEngine
     instance. See module docstring for why the engine is injected
@@ -134,6 +149,16 @@ def create_app(correlation_engine: CorrelationEngine, require_auth: bool = True)
     wiring should never pass False. See config.yaml's `api:` section
     - this should mirror `api.require_auth` from config, not be
     hardcoded at the call site.
+
+    blocker: optional response.blocker.IPBlocker instance, used only
+    by GET /summary for blocked_ip_count. Typed as `object` rather
+    than importing IPBlocker directly - response/blocker.py pulls in
+    nftables/iptables subprocess plumbing that has no business being
+    an import-time dependency of the API module, which needs to stay
+    importable (e.g. for tests, or a future read-only API-only
+    deployment) even somewhere blocker.py's system calls wouldn't
+    work. Left None, /summary reports blocked_ip_count as 0 rather
+    than failing - see that route's docstring.
     """
     app = FastAPI(
         title="Sentinel Incidents API",
@@ -149,6 +174,40 @@ def create_app(correlation_engine: CorrelationEngine, require_auth: bool = True)
     @app.get("/health")
     def health():
         return {"status": "ok"}
+
+    @app.get("/summary", response_model=SummaryOut, dependencies=auth_deps)
+    def summary():
+        """
+        Headline numbers for a dashboard's top-level view - see
+        SummaryOut's docstring for why this exists as its own route
+        instead of making every client fetch /incidents and aggregate
+        it locally.
+
+        risk_tier_breakdown only counts OPEN incidents (a resolved
+        incident's risk tier isn't part of "what's the state of things
+        right now"), keyed by RiskTier's string values so every tier
+        is always present in the response (0 for tiers with no open
+        incidents) rather than a client having to handle a
+        possibly-missing key.
+
+        blocked_ip_count is 0 if this app was built without a blocker
+        (blocker=None) - see create_app's docstring. Not an error
+        condition: a pcap-replay run or a test harness legitimately
+        has no live blocker to report on.
+        """
+        open_incidents = correlation_engine.open_incidents()
+
+        tier_breakdown = {tier.value: 0 for tier in RiskTier}
+        for incident in open_incidents:
+            tier_breakdown[assess_risk(incident).tier.value] += 1
+
+        blocked_ip_count = len(blocker.currently_blocked()) if blocker is not None else 0
+
+        return SummaryOut(
+            open_incident_count=len(open_incidents),
+            risk_tier_breakdown=tier_breakdown,
+            blocked_ip_count=blocked_ip_count,
+        )
 
     @app.get("/incidents", response_model=list[IncidentSummaryOut], dependencies=auth_deps)
     def list_incidents(include_resolved: bool = False):

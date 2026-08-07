@@ -223,3 +223,80 @@ class TestSuccessPaths:
         assert response.json()["status"] == "OPEN"
         open_list = client.get("/incidents", headers=headers).json()
         assert any(i["key"] == src_ip for i in open_list)
+
+
+class TestSummaryEndpoint:
+    """Coverage for GET /summary (Phase 4.1') - see api/app.py's
+    SummaryOut/summary() docstrings for the shape and rationale."""
+
+    def test_summary_gated_behind_auth(self, engine, monkeypatch):
+        monkeypatch.setenv("SENTINEL_API_KEY", _TEST_KEY)
+        app = create_app(engine, require_auth=True)
+        client = TestClient(app)
+
+        assert client.get("/summary").status_code == 401
+        assert client.get("/summary", headers={"X-API-Key": _TEST_KEY}).status_code == 200
+
+    def test_empty_engine_reports_all_zero(self, engine, monkeypatch):
+        monkeypatch.setenv("SENTINEL_API_KEY", _TEST_KEY)
+        app = create_app(engine, require_auth=True)
+        client = TestClient(app)
+
+        body = client.get("/summary", headers={"X-API-Key": _TEST_KEY}).json()
+
+        assert body["open_incident_count"] == 0
+        assert body["blocked_ip_count"] == 0
+        # Every RiskTier value must be present (as 0), not just the
+        # tiers that happen to have incidents - see summary()'s
+        # docstring on why a client shouldn't have to handle a
+        # possibly-missing key.
+        assert set(body["risk_tier_breakdown"].keys()) == {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
+        assert sum(body["risk_tier_breakdown"].values()) == 0
+
+    def test_open_incident_is_counted_and_tiered(self, engine, monkeypatch):
+        monkeypatch.setenv("SENTINEL_API_KEY", _TEST_KEY)
+        _seed_open_incident(engine)
+        app = create_app(engine, require_auth=True)
+        client = TestClient(app)
+
+        body = client.get("/summary", headers={"X-API-Key": _TEST_KEY}).json()
+
+        assert body["open_incident_count"] == 1
+        assert sum(body["risk_tier_breakdown"].values()) == 1
+
+    def test_resolved_incident_is_not_counted(self, engine, monkeypatch):
+        """A resolved incident is no longer part of 'what's the state
+        of things right now' - summary() only counts open_incidents()."""
+        monkeypatch.setenv("SENTINEL_API_KEY", _TEST_KEY)
+        src_ip = _seed_open_incident(engine)
+        engine.resolve(src_ip)
+        app = create_app(engine, require_auth=True)
+        client = TestClient(app)
+
+        body = client.get("/summary", headers={"X-API-Key": _TEST_KEY}).json()
+
+        assert body["open_incident_count"] == 0
+        assert sum(body["risk_tier_breakdown"].values()) == 0
+
+    def test_no_blocker_reports_zero_not_an_error(self, engine, monkeypatch):
+        """create_app(blocker=None) - the default - must not raise;
+        legitimate for pcap replay / tests with no live blocker."""
+        monkeypatch.setenv("SENTINEL_API_KEY", _TEST_KEY)
+        app = create_app(engine, require_auth=True, blocker=None)
+        client = TestClient(app)
+
+        body = client.get("/summary", headers={"X-API-Key": _TEST_KEY}).json()
+        assert body["blocked_ip_count"] == 0
+
+    def test_blocker_count_is_reflected(self, engine, monkeypatch):
+        monkeypatch.setenv("SENTINEL_API_KEY", _TEST_KEY)
+
+        class FakeBlocker:
+            def currently_blocked(self):
+                return {"10.0.0.5": 120.0, "10.0.0.9": 45.0}
+
+        app = create_app(engine, require_auth=True, blocker=FakeBlocker())
+        client = TestClient(app)
+
+        body = client.get("/summary", headers={"X-API-Key": _TEST_KEY}).json()
+        assert body["blocked_ip_count"] == 2
