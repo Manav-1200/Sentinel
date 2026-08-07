@@ -381,6 +381,13 @@ def run_live_capture(config: dict) -> None:
             f"{cef_config.get('host', 'localhost')}:{cef_config.get('port', 514)} (UDP syslog)[/dim]"
         )
 
+    # Phase 3: GeoIP enrichment, alerting, and auto-blocking — one
+    # shared stack for the whole pipeline. See build_response_stack().
+    # Constructed HERE, before the Incidents REST API block below,
+    # specifically so `blocker` already exists in time to be passed
+    # into create_app() for GET /summary's blocked_ip_count.
+    geoip, alert_manager, blocker = build_response_stack(config)
+
     # Incidents REST API — runs in the SAME process as the capture
     # loop, sharing this exact correlation_engine instance (not a copy)
     # so /incidents reflects real-time state. See api/app.py's module
@@ -394,7 +401,11 @@ def run_live_capture(config: dict) -> None:
         import uvicorn
         from api.app import create_app
 
-        api_app = create_app(correlation_engine, require_auth=api_config.get("require_auth", True))
+        api_app = create_app(
+            correlation_engine,
+            require_auth=api_config.get("require_auth", True),
+            blocker=blocker,
+        )
         mount_metrics(api_app, metrics=metrics)
         api_host = api_config.get("host", "127.0.0.1")
         api_port = int(api_config.get("port", 8787))
@@ -436,10 +447,6 @@ def run_live_capture(config: dict) -> None:
     # down in the loop, same pattern as cli_display's own periodic
     # summary line.
     retention = RetentionManager(config, correlation_engine)
-
-    # Phase 3: GeoIP enrichment, alerting, and auto-blocking — one
-    # shared stack for the whole pipeline. See build_response_stack().
-    geoip, alert_manager, blocker = build_response_stack(config)
 
     # Attempt to train the supervised classifier from whatever labelled
     # data already exists. classifier will be None if there isn't
