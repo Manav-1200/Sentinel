@@ -8,6 +8,8 @@ identity-field presence/absence contract each detector is documented
 to have (see evidence.py's module docstring).
 """
 
+import json
+
 import pytest
 
 from detection.evidence import (
@@ -245,3 +247,93 @@ class TestEvidenceIdShapes:
         evidence = from_ddos(result, timestamp=1.0)
         text = repr(evidence)
         assert "detector=ddos" in text
+
+class TestToDictJSONSerialisation:
+    """Regression coverage for a real bug found during end-to-end
+    pcap-replay testing: Evidence.to_dict()'s payload field (built via
+    _serialise()) crashed json.dumps() with "Object of type
+    DetectionResult is not JSON serializable" the moment ANY anomaly
+    evidence was stored - which is every single flow, since
+    from_anomaly() is called unconditionally per flow. Confirmed on
+    the unmodified repo before this fix, so this was a real,
+    completely-broken-since-day-one path, not a regression from other
+    changes.
+
+    Root cause: DetectionResult (detection/anomaly.py) was a plain
+    __init__-based class while every other detector's result type
+    (DDoSCheckResult, PortScanCheckResult, BruteForceResult) was
+    already a @dataclass - and _serialise() only knows how to recurse
+    through @dataclass instances (plus Enums/dicts/lists). Fixed by
+    making DetectionResult a @dataclass to match its siblings. These
+    tests exist so a future detector result type that forgets
+    @dataclass fails LOUDLY here in under a second, instead of only
+    surfacing three hours into a live capture run or a pcap replay.
+    """
+
+    def _assert_json_round_trips(self, evidence):
+        """The actual failure mode was json.dumps() raising - so the
+        real assertion is just that this doesn't raise, on the exact
+        same code path pipeline/labeller.py's store_evidence() uses."""
+        row = evidence.to_dict()
+        payload_json = json.dumps(row.pop("payload"))
+        assert isinstance(payload_json, str)
+        # And round-trips back into something usable, not just "some string".
+        reloaded = json.loads(payload_json)
+        assert isinstance(reloaded, dict)
+        return reloaded
+
+    def test_anomaly_evidence_payload_is_json_serialisable(self):
+        """The specific case that was broken - DetectionResult via
+        from_anomaly(). Covers both a real score and the WARMING_UP
+        (score=None) case, since None needs to survive the round trip
+        as JSON null, not crash or get silently dropped."""
+        result = DetectionResult(
+            verdict=Verdict.SUSPICIOUS,
+            score=-0.42,
+            features={"src_ip": "10.0.0.5", "dst_ip": "10.0.0.9", "dst_port": 22, "total_packets": 40},
+        )
+        evidence = from_anomaly(result, timestamp=1000.0)
+        reloaded = self._assert_json_round_trips(evidence)
+        assert reloaded["verdict"] == "SUSPICIOUS"
+        assert reloaded["score"] == -0.42
+        assert reloaded["features"]["src_ip"] == "10.0.0.5"
+
+    def test_warming_up_score_none_survives_as_json_null(self):
+        result = DetectionResult(verdict=Verdict.WARMING_UP, score=None, features={"src_ip": "10.0.0.5"})
+        evidence = from_anomaly(result, timestamp=1000.0)
+        reloaded = self._assert_json_round_trips(evidence)
+        assert reloaded["score"] is None
+
+    def test_ddos_evidence_payload_is_json_serialisable(self):
+        result = DDoSCheckResult(
+            verdict=DDoSVerdict.ATTACK, total_flows_in_window=500,
+            distinct_sources_in_window=25, window_seconds=10.0,
+        )
+        evidence = from_ddos(result, timestamp=1000.0)
+        self._assert_json_round_trips(evidence)
+
+    def test_port_scan_evidence_payload_is_json_serialisable(self):
+        result = PortScanCheckResult(
+            verdict=PortScanVerdict.ATTACK, src_ip="10.0.0.5", window_seconds=10.0,
+            distinct_ports_in_window=25, distinct_targets_in_window=1,
+            scan_start_timestamp=1000.0, scan_end_timestamp=1005.0,
+            duration_seconds=5.0, ports_per_second=5.0, confidence_pct=100.0,
+        )
+        evidence = from_port_scan(result, timestamp=1005.0)
+        self._assert_json_round_trips(evidence)
+
+    def test_brute_force_evidence_payload_is_json_serialisable(self):
+        result = BruteForceResult(
+            BruteForceVerdict.ATTACK, "10.0.0.5", "10.0.0.9", 22,
+            attempts_in_window=10, window_seconds=60.0, repeat_offender_count=1,
+        )
+        evidence = from_brute_force(result, timestamp=1000.0)
+        self._assert_json_round_trips(evidence)
+
+    def test_llm_evidence_payload_is_json_serialisable(self):
+        result = AnalysisResult(
+            available=True, attack_type="port_scan",
+            confidence=AnalysisConfidence.HIGH, reasoning="Clear scan pattern.",
+        )
+        evidence = from_llm(result, timestamp=1000.0, src_ip="10.0.0.5", dst_ip="10.0.0.9", dst_port=22)
+        self._assert_json_round_trips(evidence)

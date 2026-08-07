@@ -111,6 +111,7 @@ flood rule from noise alone.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
@@ -202,18 +203,30 @@ class Verdict(str, Enum):
     ATTACK = "ATTACK"
 
 
+@dataclass
 class DetectionResult:
     """
     The result of running detection on a single flow's features.
     Bundles the raw score together with the human-readable verdict
     so downstream modules (logging, response) don't need to know
     about threshold values themselves.
-    """
 
-    def __init__(self, verdict: Verdict, score: Optional[float], features: dict):
-        self.verdict = verdict
-        self.score = score          # Raw Isolation Forest score, or None during warm-up
-        self.features = features    # The original feature dict (includes identity fields)
+    Converted to a @dataclass (was a plain __init__-based class) to
+    fix a real bug: detection/evidence.py's _serialise() - used to
+    JSON-encode Evidence.payload for DB storage - only knows how to
+    recurse through @dataclass instances, Enums, dicts, and lists. A
+    plain class instance falls through every check in _serialise and
+    comes back out unchanged, which then blows up json.dumps() with
+    "Object of type DetectionResult is not JSON serializable" - this
+    crashed pcap replay (main.py --pcap) on the very first anomaly
+    evidence, confirmed on the unmodified repo before this fix. Every
+    other detector's result type (DDoSCheckResult,
+    PortScanCheckResult, BruteForceResult) was already a dataclass -
+    this was the one exception.
+    """
+    verdict: Verdict
+    score: Optional[float]   # Raw Isolation Forest score, or None during warm-up
+    features: dict           # The original feature dict (includes identity fields)
 
     def __repr__(self) -> str:
         score_str = f"{self.score:.4f}" if self.score is not None else "N/A"

@@ -140,3 +140,86 @@ class TestDefaultBehaviour:
         response = client.get("/incidents")
 
         assert response.status_code == 401
+
+
+def _seed_open_incident(engine, src_ip="10.0.0.5"):
+    """Builds one real Evidence object (via the real from_port_scan
+    factory, not a hand-rolled dict) and files it into the engine, so
+    the success-path tests below exercise the actual
+    _to_summary()/build_timeline()/model_dump() machinery in app.py
+    against a real Incident, rather than just confirming they don't
+    crash on missing data (the only thing the 404-only tests above
+    covered)."""
+    from detection.evidence import from_port_scan
+    from detection.port_scan_tracker import PortScanCheckResult, PortScanVerdict
+
+    result = PortScanCheckResult(
+        verdict=PortScanVerdict.ATTACK,
+        src_ip=src_ip,
+        window_seconds=10.0,
+        distinct_ports_in_window=25,
+        distinct_targets_in_window=1,
+        scan_start_timestamp=1000.0,
+        scan_end_timestamp=1005.0,
+        duration_seconds=5.0,
+        ports_per_second=5.0,
+        confidence_pct=100.0,
+    )
+    engine.add_evidence(from_port_scan(result, timestamp=1005.0))
+    return src_ip
+
+
+class TestSuccessPaths:
+    """Previously only the 404 branches of get/resolve/reopen had any
+    coverage - these exercise the actual 200 paths against a real
+    Incident built from a real Evidence object."""
+
+    def test_get_incident_returns_full_detail(self, engine, monkeypatch):
+        monkeypatch.setenv("SENTINEL_API_KEY", _TEST_KEY)
+        src_ip = _seed_open_incident(engine)
+        app = create_app(engine, require_auth=True)
+        client = TestClient(app)
+
+        response = client.get(f"/incidents/{src_ip}", headers={"X-API-Key": _TEST_KEY})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["key"] == src_ip
+        assert body["status"] == "OPEN"
+        assert body["evidence_count"] == 1
+        assert len(body["evidence"]) == 1
+        assert body["evidence"][0]["detector"] == "port_scan"
+        assert body["risk"]["score"] > 0
+
+    def test_resolve_flips_status_and_drops_out_of_default_list(self, engine, monkeypatch):
+        monkeypatch.setenv("SENTINEL_API_KEY", _TEST_KEY)
+        src_ip = _seed_open_incident(engine)
+        app = create_app(engine, require_auth=True)
+        client = TestClient(app)
+        headers = {"X-API-Key": _TEST_KEY}
+
+        response = client.post(f"/incidents/{src_ip}/resolve", headers=headers)
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "RESOLVED"
+
+        open_list = client.get("/incidents", headers=headers).json()
+        assert all(i["key"] != src_ip for i in open_list)
+
+        full_list = client.get("/incidents?include_resolved=true", headers=headers).json()
+        assert any(i["key"] == src_ip for i in full_list)
+
+    def test_reopen_flips_status_back_to_open(self, engine, monkeypatch):
+        monkeypatch.setenv("SENTINEL_API_KEY", _TEST_KEY)
+        src_ip = _seed_open_incident(engine)
+        app = create_app(engine, require_auth=True)
+        client = TestClient(app)
+        headers = {"X-API-Key": _TEST_KEY}
+
+        client.post(f"/incidents/{src_ip}/resolve", headers=headers)
+        response = client.post(f"/incidents/{src_ip}/reopen", headers=headers)
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "OPEN"
+        open_list = client.get("/incidents", headers=headers).json()
+        assert any(i["key"] == src_ip for i in open_list)
