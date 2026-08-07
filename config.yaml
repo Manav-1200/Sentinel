@@ -245,7 +245,7 @@ geoip:
 # ------------------------------------------------------------
 storage:
   # SQLite database for all flow logs and labelled samples.
-  db_path: "data/logs/sentinel.db"
+  db_path: "/tmp/sentinel_smoke.db"
 
   # Plain-text JSON-lines log for detections (one JSON object per line).
   detections_log: "data/logs/detections.log"
