@@ -1120,6 +1120,13 @@ def main() -> None:
         help="Enable dry-run mode: log what would be blocked but do not apply iptables rules."
     )
     parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Launch the Textual TUI dashboard - connects to an already-running "
+             "Sentinel instance's Incidents API (does NOT start capture itself). "
+             "Run 'sudo python main.py' in another terminal first."
+    )
+    parser.add_argument(
         "--config",
         type=str,
         default="config.yaml",
@@ -1150,6 +1157,9 @@ def main() -> None:
         run_train(config)
     elif args.rollback:
         run_rollback(config)
+    elif args.dashboard:
+        from detection.tui_dashboard import run_dashboard
+        run_dashboard(config)
     elif args.pcap:
         run_pcap(config, args.pcap)
     else:

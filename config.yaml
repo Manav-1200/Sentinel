@@ -352,6 +352,26 @@ api:
   require_auth: true
 
 # ------------------------------------------------------------
+# TUI Dashboard (detection/tui_dashboard.py, `python main.py --dashboard`)
+# ------------------------------------------------------------
+# This is a genuinely separate process from live capture (see that
+# module's docstring for why) - it connects to the `api:` section
+# above as an HTTP CLIENT, it does not read this config to start
+# anything of its own. host/port are intentionally NOT duplicated
+# here; the dashboard always connects to whatever `api:` says, so
+# there's only one place to change if you move the API to a
+# different port.
+#
+# NOTE: this is a fresh section, not the old stale `dashboard:` block
+# that used to live in this file (removed earlier - see git history -
+# it had a dead api_port/api_key/recent_flows_limit that nothing
+# read). This one is actually wired to something real.
+dashboard:
+  # How often (seconds) the dashboard re-polls /summary and
+  # /incidents. Lower = more current, more requests against the API.
+  refresh_interval_seconds: 2.0
+
+# ------------------------------------------------------------
 # SIEM export (CEF over syslog) — observability/cef_export.py.
 # Off by default: most deployments don't have a SIEM listener to send
 # to yet, and CEFSyslogExporter's own _safe_send() already guarantees
