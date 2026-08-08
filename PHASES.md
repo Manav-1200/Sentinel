@@ -467,16 +467,25 @@ Everything above was built and tested standalone first (matching how Phase 1–3
 ### 4.0' — Backend API — mostly already done in Phase 3.5
 
 - [x] REST API exists and is wired into `main.py` (`api/app.py`, Phase 3.5.5) — `/incidents`, `/incidents/{key}`, resolve/reopen, `/metrics`.
-- [ ] **API key authentication — hard prerequisite for the native app track (4.2'), not optional.** The TUI doesn't need this (runs in-process, no HTTP hop) but the native app talks to `api/app.py` over real HTTP.
-- [ ] New lightweight `/summary` endpoint (open incident count, risk tier breakdown, currently-blocked IP count) so a dashboard's top-level view doesn't have to fetch and locally aggregate every incident just for a few numbers.
+- [x] ~~**API key authentication — hard prerequisite for the native app track (4.2'), not optional.**~~ DONE (`api/auth.py`) — and turned out to be a prerequisite for the TUI too, not just the native app (see 4.1' below for why the original "TUI runs in-process, no HTTP hop" assumption changed).
+- [x] ~~New lightweight `/summary` endpoint~~ DONE — `open_incident_count`, `risk_tier_breakdown` (all 4 tiers always present), `blocked_ip_count`.
 
-### 4.1' — Terminal UI (build this first)
+### 4.1' — Terminal UI — DONE, but architecturally pivoted from the plan below — see note
 
-- [ ] New `detection/tui_dashboard.py`, built with **Textual** (same team as `rich`, already a dependency) — NOT an extension of `cli_display.py`, a separate panelled view. `cli_display.py`'s existing flat scrolling log is genuinely the right tool for "what's happening right now, scroll back through it" (its own docstring documents why an earlier `rich.Live` table version was wrong for that job) — a panelled "current state of all open incidents" view is a different, complementary job, not a v2 of the same one.
-- [ ] Multi-pane layout: open-incidents list (risk tier, detectors involved) + selected-incident detail (risk score, MITRE techniques, scrollable timeline via `detection/timeline.py`) + the existing scrolling flow log embedded as one pane.
-- [ ] Runs in-process with `main.py` — reads `correlation_engine`/`risk_engine`/`mitre_attack` directly, no HTTP round-trip to its own API needed.
-- [ ] Resolve/reopen as real keybindings (`r`/`o`) calling `correlation_engine.resolve()`/`.reopen()` directly.
-- [ ] `--dashboard`/`--classic` flag (or config option) to choose between today's flat log and the new panelled view — the flat log stays useful for piping to `less`/`grep`, which a panelled TUI can't do.
+**Deviation from the original plan, found and corrected mid-build, documented here rather than silently overwritten:** the plan below said the TUI would run in-process with `main.py`, reading `correlation_engine`/`risk_engine`/`mitre_attack` directly, with auth scoped as a blocker for 4.2' (native app) specifically because the TUI "doesn't need this (runs in-process, no HTTP hop)". What actually got built is the opposite: `detection/tui_dashboard.py` is a genuine HTTP client of `api/app.py`, run as a **separate process** (`python main.py --dashboard` in a second terminal, while `sudo python main.py` runs capture + the API in the first). Reasoning for the pivot, decided explicitly rather than assumed:
+  - Matches 4.2's own "always-a-client" philosophy for the future multi-sensor aggregator (`docs/multi_sensor_architecture.md`) — an HTTP-based TUI already works against a remote sensor with zero extra work; an in-process one never could.
+  - One client pattern to maintain for both front-ends instead of two different integration models (in-process vs HTTP).
+  - Avoids the real unresolved technical question of how Textual's own asyncio app loop and `main.py`'s synchronous capture loop would share one terminal/process — the API-background-thread pattern `main.py` already uses for `api/app.py` made "TUI as another client, not another thread fighting for the same terminal" the lower-risk path.
+  - **Real cost, not hidden:** no MITRE techniques pane (the API doesn't expose MITRE mapping data at all yet — would need a new endpoint, not just a wiring change) and no direct resolve/reopen keybindings (v1 stayed deliberately read-only, scope-matched to what was decided as "fuller v1: summary + incidents list + incident detail").
+- [x] `detection/tui_dashboard.py`, built with Textual. `SentinelAPIClient` (async httpx client, testable via `httpx.ASGITransport` — no real socket needed in tests) + `SentinelDashboardApp` (summary strip, sortable-by-risk open-incidents table, modal incident detail view with full evidence timeline).
+- [x] Multi-pane layout — summary panel + incidents table + modal detail-on-select (`Enter`/`Escape`), not the originally-planned three-simultaneous-panes-plus-embedded-flow-log — the flow log stayed out entirely since it's `cli_display.py`'s job, and this process doesn't run capture.
+- [ ] ~~Runs in-process...~~ — superseded, see deviation note above.
+- [ ] Resolve/reopen keybindings — not built in v1 (read-only client), tracked as a follow-up once the read side proves out.
+- [x] `--dashboard` flag added to `main.py`. No separate `--classic` flag needed — since the TUI is a different process entirely, plain `sudo python main.py` (no flag) already gives the flat log unchanged; there's nothing to switch between within one invocation anymore.
+- [x] Tests: `tests/test_tui_dashboard.py` — 11 tests, real `api/app.py` FastAPI app via ASGITransport (not mocked), Textual driven headlessly via `App.run_test()`. Covers: summary/incident/detail fetch, wrong-key and missing-server-key error surfacing, detail screen rendering real evidence, resolved-incident toggle. `detection/tui_dashboard.py` at 90% coverage — the gap is `run_dashboard()`'s actual `app.run()` terminal takeover (untestable without a real tty) and the raw-connection-error branch (can't simulate via ASGITransport).
+- [x] Verified end-to-end: real `uvicorn` server + real seeded incident + headless Textual pilot — connects, renders summary/table/detail, keybindings work. Also verified `main.py --dashboard`'s full CLI dispatch chain (config → `run_dashboard` → `SentinelDashboardApp` construction → `.run()`) via a mocked `.run()` call, since a real terminal isn't available in a sandboxed test environment.
+
+
 
 ### 4.2' — Native desktop app (after 4.0'/4.1', biggest single piece of new work)
 
