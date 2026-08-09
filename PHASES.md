@@ -8,7 +8,7 @@
 >
 > **Repo:** `github.com/Manav-1200/sentinel`
 >
-> **Stack:** Python 3.11+, Scapy, scikit-learn, XGBoost, SQLite → PostgreSQL, Streamlit → React, Claude API, iptables/nftables, ip-api.com / MaxMind GeoLite2.
+> **Stack:** Python 3.11+, Scapy, scikit-learn, XGBoost, SQLite, FastAPI + Textual (TUI dashboard) + native app (planned), Claude API / NVIDIA NIM, iptables/nftables, ip-api.com / MaxMind GeoLite2.
 
 ---
 
@@ -19,8 +19,8 @@
 | 1 | Foundation | Packet capture + feature extraction + anomaly/flood/DDoS detection (CLI) | Project 1 | ✅ Complete — 43 passing tests |
 | 2 | Intelligence | Supervised ML + LLM log analysis + self-labelling pipeline + port-scan detection | Project 1 v2 | ✅ Complete — 99 passing tests, 72%+ coverage (verified end-to-end on real nmap scans, real floods, real DDoS traffic) — tagged `v2.0-supervised-learning` |
 | 3 | Response | Auto-blocking (nftables/iptables) + GeoIP + alerting | Project 2 | ✅ Complete — all real-hardware gaps closed (webhook delivery, real nftables block + expiry, iptables fallback, DDoS alert-only branch verified via deterministic synthetic pcap), 153 passing tests total |
-| 3.5 | Enterprise Readiness | Evidence/Incident/Risk fusion, MITRE ATT&CK tagging, observability (Prometheus metrics, CEF/SIEM export, structured JSON-lines logging), incident reporting (CSV/Markdown), incidents REST API, plus design docs for multi-sensor deployment / DB retention / secrets hardening | Project 2 v1.5 | ✅ Complete — code + tests; three items are design docs only, not yet implemented (see Phase 3.5 below) |
-| 4 | Dashboard | Terminal UI (Textual) + native desktop app, both sitting on the Phase 3.5 incidents API — no browser dashboard | Project 2 v2 | Design doc complete (`docs/phase4_dashboard_architecture.md`) — build not started |
+| 3.5 | Enterprise Readiness | Evidence/Incident/Risk fusion, MITRE ATT&CK tagging, observability (Prometheus metrics, CEF/SIEM export, structured JSON-lines logging), incident reporting (CSV/Markdown), incidents REST API + auth, DB retention/rotation | Project 2 v1.5 | ✅ Complete — API auth and DB retention (previously design-docs-only) both implemented and tested; multi-sensor deployment and secrets hardening remain design docs only |
+| 4 | Dashboard | Terminal UI (Textual) + native desktop app, both sitting on the Phase 3.5 incidents API — no browser dashboard | Project 2 v2 | TUI (4.1') complete — real HTTP client, see Phase 4 section for the documented architecture pivot from the original in-process design. Native app (4.2') not started. 348 passing tests total. |
 | 5 | Production | Auto-retraining pipeline + model versioning + hardening | Project 3 | Not started |
 | 6 | Extras | Ideas to add during development (add freely) | — | Ongoing |
 
@@ -460,7 +460,7 @@ Everything above was built and tested standalone first (matching how Phase 1–3
 
 ## Phase 4 — Dashboard
 
-**Goal:** replace the CLI table with something that shows fused, correlated incidents at a glance — not a raw flow feed. **Design doc:** `docs/phase4_dashboard_architecture.md`.
+**Goal:** replace the CLI table with something that shows fused, correlated incidents at a glance — not a raw flow feed. **Design doc:** `docs/phase4_dashboard_architecture.md` — **note: this file is referenced throughout this section but is not actually present in the repo as of the TUI build (4.1'). Either it was never saved or didn't survive a prior handoff. Worth re-creating or removing the references if it's confirmed gone for good.**
 
 **Decision that supersedes the original plan below:** no browser-based web dashboard. Two front-ends instead — a richer terminal UI for anyone comfortable on a terminal, and a genuine native desktop app (not a browser tab) for anyone who isn't — both sitting on top of the incidents API that Phase 3.5 already built and tested (`api/app.py`, plus `/metrics`). Neither front-end needs its own detection logic, risk scoring, or MITRE mapping — that layer is already correct and already tested; both front-ends are pure consumers of it. The original 4.1/4.2 plan below (Streamlit/React, world map, WebSocket) is kept for reference but is superseded by 4.1'/4.2'/4.3' underneath it.
 
