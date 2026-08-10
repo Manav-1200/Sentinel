@@ -1127,6 +1127,13 @@ def main() -> None:
              "Run 'sudo python main.py' in another terminal first."
     )
     parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Launch the native PySide6 desktop app - same idea as --dashboard "
+             "but a GUI window instead of a terminal UI, with Resolve/Reopen "
+             "buttons. Also connects to an already-running instance's API."
+    )
+    parser.add_argument(
         "--config",
         type=str,
         default="config.yaml",
@@ -1160,6 +1167,9 @@ def main() -> None:
     elif args.dashboard:
         from detection.tui_dashboard import run_dashboard
         run_dashboard(config)
+    elif args.gui:
+        from detection.gui_dashboard import run_gui
+        run_gui(config)
     elif args.pcap:
         run_pcap(config, args.pcap)
     else:

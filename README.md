@@ -2,7 +2,7 @@
 
 **Real-time network threat detection and response.**
 
-Sentinel is an AI-powered Network Intrusion Detection and Response System (NIDRS) built from scratch — no pre-packaged datasets, no inherited code. It's built in phases (see [`PHASES.md`](PHASES.md)); **Phases 1–3.5 are complete and verified against real attack traffic on real hardware**: detection (anomaly/flood/DDoS/port-scan/brute-force), ML classification + LLM self-labelling, auto-blocking + GeoIP + alerting, and an enterprise-readiness layer (incident correlation, risk scoring, MITRE ATT&CK tagging, observability, a REST API with auth, DB retention). **Phase 4's terminal dashboard is also complete** — a native desktop app is next.
+Sentinel is an AI-powered Network Intrusion Detection and Response System (NIDRS) built from scratch — no pre-packaged datasets, no inherited code. It's built in phases (see [`PHASES.md`](PHASES.md)); **Phases 1–4 are complete**: detection (anomaly/flood/DDoS/port-scan/brute-force), ML classification + LLM self-labelling, auto-blocking + GeoIP + alerting, an enterprise-readiness layer (incident correlation, risk scoring, MITRE ATT&CK tagging, observability, a REST API with auth, DB retention), and a full dashboard layer (Textual TUI + native PySide6 app).
 
 ![Tests](https://github.com/Manav-1200/sentinel/actions/workflows/test.yml/badge.svg)
 ![Python](https://img.shields.io/badge/python-3.11+-blue)
@@ -40,9 +40,9 @@ Along the way this surfaced and fixed several real production-grade issues — k
 
 **Enterprise readiness (Phase 3.5 — complete):** unified `Evidence` object across every detector · `IncidentCorrelationEngine` (incidents group by source, never auto-close) · trust-weighted `RiskEngine` (multi-detector corroboration bonus) · MITRE ATT&CK technique tagging · Prometheus metrics · CEF/SIEM export · structured JSON-lines logging · Markdown incident reports · authenticated REST API (`api/app.py` — static per-deployment key via `SENTINEL_API_KEY`, every route but `/health` gated) · three-tier DB retention/rotation (`pipeline/retention.py` — bulk evidence, resolved-incident findings, training-sample size cap; batched deletes + interval-gated VACUUM).
 
-**Dashboard (Phase 4.1′ — complete):** Textual TUI (`detection/tui_dashboard.py`, `python main.py --dashboard`) — a genuine HTTP client of the incidents API, run as a separate process alongside live capture. Live summary panel (open incidents, risk tier breakdown, blocked IP count), an open-incidents table sortable by risk, and a full incident-detail view with evidence timeline. See `PHASES.md`'s Phase 4 section for why this pivoted from an originally-planned in-process design to an HTTP-client one.
+**Dashboard (Phase 4 — complete):** Textual TUI (`detection/tui_dashboard.py`, `python main.py --dashboard`) and a native PySide6 desktop app (`detection/gui_dashboard.py`, `python main.py --gui`) — both genuine HTTP clients of the incidents API, run as separate processes alongside live capture. The TUI is read-only (summary panel, sortable-by-risk incidents table, evidence-timeline detail view). The GUI adds Resolve/Reopen buttons on top of the same feature set. See `PHASES.md`'s Phase 4 section for why this pivoted from an originally-planned in-process TUI design to an HTTP-client one, and for a rundown of real threading bugs (Qt `QTimer` thread-affinity, a `NameError` in an error-handling path, a status-message typo) found and fixed via testing against real running API servers, not just mocked ones.
 
-**Planned:** native desktop app (Phase 4.2′, Tauri vs PySide6 still undecided) · auto-retraining + model versioning (Phase 5). Full roadmap in [`PHASES.md`](PHASES.md).
+**Planned:** auto-retraining + model versioning (Phase 5). Full roadmap in [`PHASES.md`](PHASES.md).
 
 ---
 
@@ -61,7 +61,7 @@ sentinel/
 ├── reporting/          Markdown incident reports
 ├── pipeline/           Self-labelling, DB retention/rotation, auto-retraining (planned)
 ├── dashboard/          (legacy placeholder — the real dashboard is detection/tui_dashboard.py)
-├── tests/              Unit tests for every module (348 passing)
+├── tests/              Unit tests for every module (359 passing)
 ├── docs/               Write-ups, safety notes, deployment guide
 ├── data/
 │   ├── logs/           SQLite DB, detection logs, block logs
@@ -102,7 +102,7 @@ Run as your normal user from here on. This resets on Python package updates (e.g
 cp .env.example .env
 ```
 
-Set `SENTINEL_API_KEY` in `.env` to a random string — the incidents API (and the TUI dashboard, which talks to it) won't start without it. Check `config.yaml`:
+Set `SENTINEL_API_KEY` in `.env` to a random string — the incidents API (and both dashboard front-ends, which talk to it) won't start without it. Check `config.yaml`:
 - `capture.interfaces` — `"auto"` or an explicit list; include `docker0` if testing with Docker-sourced traffic
 - `response.dry_run` — keep `true` unless you want live nftables/iptables rules applied; `response.block_private_ranges` should be `true` if your LAN is entirely private-range
 - `llm.provider` — `"nim"` (free tier, default) or `"anthropic"`
@@ -119,6 +119,7 @@ python main.py --interface wlo1,enp2s0       # explicit interfaces
 python main.py --pcap path/to/capture.pcap   # replay a pcap
 python main.py --label                       # check labelled-sample stats
 python main.py --dashboard                   # TUI dashboard (run alongside live capture, in a second terminal)
+python main.py --gui                          # native PySide6 app (same idea, GUI window + Resolve/Reopen buttons)
 ```
 
 ### 5. Simulate an attack safely
@@ -148,7 +149,7 @@ Then check `python main.py --label` for `label: port_scan`, `label_source: port_
 pytest tests/ -v
 ```
 
-348 tests covering flow assembly, feature extraction, anomaly/flood/DDoS/port-scan/brute-force detection, the self-labelling pipeline, the LLM analyser, the classifier, the blocker, alerting, incident correlation/risk scoring, MITRE tagging, the REST API (auth included), DB retention, and the TUI dashboard — run on every push via GitHub Actions.
+359 tests covering flow assembly, feature extraction, anomaly/flood/DDoS/port-scan/brute-force detection, the self-labelling pipeline, the LLM analyser, the classifier, the blocker, alerting, incident correlation/risk scoring, MITRE tagging, the REST API (auth included), DB retention, and both dashboard front-ends — run on every push via GitHub Actions.
 
 ---
 
@@ -160,7 +161,7 @@ pytest tests/ -v
 | 2 — Intelligence | Supervised ML + LLM self-labelling + port-scan detection | ✅ Complete |
 | 3 — Response | Auto-blocking + GeoIP + alerting | ✅ Complete, real-hardware verified |
 | 3.5 — Enterprise Readiness | Incident correlation, risk scoring, MITRE tagging, observability, authenticated REST API, DB retention | ✅ Complete |
-| 4 — Dashboard | Terminal UI (done) + native desktop app (planned) | TUI complete, native app not started |
+| 4 — Dashboard | Terminal UI + native desktop app | ✅ Complete |
 | 5 — Production | Auto-retraining + model versioning + Docker | Not started |
 
 Full task-by-task checklist and verification log in [`PHASES.md`](PHASES.md).
@@ -171,7 +172,7 @@ Full task-by-task checklist and verification log in [`PHASES.md`](PHASES.md).
 
 - The supervised classifier is currently effectively untrained (~82 diverse current-schema samples, heavy class imbalance) — still the highest-priority gap, since no code fix compensates for too little training data. The bulk-transfer/`ddos` misclassification issue has a code-level fix (`fwd_packet_share`/`ack_ratio` features, plus a canonical-schema-selection fix for a subtler stale-feature-schema bug found afterward) that's pending live re-verification against real traffic. Flood/DoS separability has `iat_cv` as a genuine partial improvement, explicitly not a full fix.
 - `ddos_tracker`/`port_scan_tracker` labelled samples are excluded from classifier training by design — their aggregate-pattern feature schema doesn't match the per-flow features the classifier uses.
-- The TUI dashboard is read-only in v1 — no resolve/reopen keybindings yet, and no MITRE techniques pane (the API doesn't expose that data as its own endpoint yet). Tracked as a follow-up once the read side has proven itself.
+- The TUI dashboard is read-only — no resolve/reopen keybindings, and no MITRE techniques pane (the API doesn't expose that data as its own endpoint yet). The native GUI app added Resolve/Reopen as buttons; the TUI hasn't caught up to that yet.
 - `docs/phase4_dashboard_architecture.md` is referenced throughout `PHASES.md`'s Phase 4 section but isn't actually present in the repo — flagged there, not yet resolved.
 
 See [`PHASES.md`](PHASES.md) for the full history and current backlog.
@@ -186,7 +187,20 @@ See [`PHASES.md`](PHASES.md) for the full history and current backlog.
 - Raw packet payloads are never logged — flow-level metadata only
 - The incidents API requires a key (`SENTINEL_API_KEY` in `.env`) on every route except `/health` — a deployment has to deliberately opt out of auth, not opt in
 
-Full details and recovery instructions: [`docs/safety.md`](docs/safety.md).
+Full details and recovery instructions: [`safety.md`](safety.md).
+
+> Note: `docs/safety.md` also exists in this repo and is stale (Phase 1-era — iptables only, no nftables, no escalating block duration). The root-level [`safety.md`](safety.md) is the current one; the duplicate under `docs/` hasn't been reconciled yet.
+
+---
+
+## Design docs
+
+A few subsystems have their own standalone design docs, kept at repo root alongside `PHASES.md`:
+
+- [`db_retention_policy.md`](db_retention_policy.md) — the tiered retention/rotation policy `pipeline/retention.py` implements (bulk evidence, resolved-incident findings, training-sample size cap).
+- [`multi_sensor_architecture.md`](multi_sensor_architecture.md) — design for a future multi-sensor aggregator polling multiple Sentinel instances' incident APIs. Not built yet; the incidents API and both dashboard front-ends were built with this in mind (thin HTTP clients, not tied to a single in-process sensor).
+- [`secrets_hardening_review.md`](secrets_hardening_review.md) — review of credential handling and hardening gaps.
+- [`docs/performance.md`](docs/performance.md) — real performance issues found and fixed (kernel-level packet loss under load, Isolation Forest sensitivity dilution, LLM SDK retry hangs, and others).
 
 ---
 
@@ -204,7 +218,7 @@ Full details and recovery instructions: [`docs/safety.md`](docs/safety.md).
 | Alerting | SMTP, Slack webhooks, generic webhook |
 | Incidents API | FastAPI, static-key auth |
 | Terminal dashboard | Textual, httpx (async HTTP client) |
-| Native app | Tauri or PySide6 — undecided, Phase 4.2′ |
+| Native app | PySide6, httpx (sync HTTP client) |
 | Observability | Prometheus metrics, CEF/SIEM export |
 | Storage | SQLite, with tiered retention/rotation |
 | CI | GitHub Actions |
