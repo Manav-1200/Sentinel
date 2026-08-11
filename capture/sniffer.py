@@ -461,6 +461,17 @@ class PacketSniffer(FlowAssembler):
         # starts; empty before that.
         self._async_sniffers: list[AsyncSniffer] = []
 
+        # Reference to the flow-assembly worker thread, stored on self
+        # (rather than as a local variable in stream_flows()) so the
+        # main loop can check .is_alive() and detect + recover from a
+        # worker that has silently died (e.g. an unhandled exception
+        # while processing a malformed packet). Without this, a dead
+        # worker looks identical to a queue backlog from the outside —
+        # the drop counter climbs and the real cause is invisible. See
+        # _process_queue's exception handling for the other half of
+        # this fix.
+        self._worker_thread: Optional[threading.Thread] = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -504,18 +515,38 @@ class PacketSniffer(FlowAssembler):
             sniffer.start()
             self._async_sniffers.append(sniffer)
 
-        worker_thread = threading.Thread(
+        self._worker_thread = threading.Thread(
             target=self._process_queue,
             daemon=True,
             name="sentinel-flow-assembly-worker",
         )
-        worker_thread.start()
+        self._worker_thread.start()
 
         # Main loop: periodically check for finished flows (both flows
         # that finished cleanly via FIN/RST, and flows that timed out
         # from inactivity), and yield them one at a time.
         while not self._stop_requested.is_set():
             self._sweep_timed_out_flows()
+
+            # Detect a worker thread that has died silently (should be
+            # rare now that _process_queue catches per-packet
+            # exceptions internally, but this is the backstop for
+            # anything that still slips through, e.g. an error in the
+            # queue.get() bookkeeping itself). Without this check, a
+            # dead worker is indistinguishable from a healthy one that
+            # is just backlogged — the drop counter climbs either way,
+            # and the operator has no way to tell which is happening.
+            if not self._worker_thread.is_alive():
+                print(
+                    "[sentinel] CRITICAL: flow-assembly worker thread has died. "
+                    "Capture was not being processed — restarting worker thread."
+                )
+                self._worker_thread = threading.Thread(
+                    target=self._process_queue,
+                    daemon=True,
+                    name="sentinel-flow-assembly-worker",
+                )
+                self._worker_thread.start()
 
             with self._lock:
                 ready = self._finished_flows
@@ -593,13 +624,25 @@ class PacketSniffer(FlowAssembler):
 
         Uses a short timeout on queue.get() so the loop can notice
         _stop_requested promptly even if no packets are arriving.
+
+        _process_one_packet() is called inside its own try/except here
+        so a single malformed/unexpected packet (e.g. an unusual Scapy
+        layer combination) can never silently kill this entire thread.
+        Before this fix, an unhandled exception here would end the
+        loop with no visible error — the queue would then fill up and
+        every subsequent packet would be misreported as a normal
+        capacity-related drop, hiding the real cause. Now the bad
+        packet is logged and skipped, and capture continues normally.
         """
         while not self._stop_requested.is_set():
             try:
                 timestamp, packet = self._packet_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            self._process_one_packet(timestamp, packet)
+            try:
+                self._process_one_packet(timestamp, packet)
+            except Exception as e:
+                print(f"[sentinel] Warning: error processing packet, skipping: {e}")
 
         # Drain any remaining queued packets on shutdown so the very
         # last burst of traffic before Ctrl+C isn't silently lost.
@@ -608,7 +651,10 @@ class PacketSniffer(FlowAssembler):
                 timestamp, packet = self._packet_queue.get_nowait()
             except queue.Empty:
                 break
-            self._process_one_packet(timestamp, packet)
+            try:
+                self._process_one_packet(timestamp, packet)
+            except Exception as e:
+                print(f"[sentinel] Warning: error processing packet during shutdown drain, skipping: {e}")
 
     # _process_one_packet, _finish_flow, _sweep_timed_out_flows, and
     # _enforce_flow_limit are all inherited from FlowAssembler — no
