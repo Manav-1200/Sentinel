@@ -245,7 +245,11 @@ geoip:
 # ------------------------------------------------------------
 storage:
   # SQLite database for all flow logs and labelled samples.
-  db_path: "/tmp/sentinel_smoke.db"
+  # Was "/tmp/sentinel_smoke.db" — a volatile smoke-test leftover
+  # that would've been wiped on reboot. Moved to a permanent path
+  # (Aug 2026) after confirming this was the live schema (evidence +
+  # labelled_flows tables) actually being written to by real capture.
+  db_path: "data/sentinel.db"
 
   # Plain-text JSON-lines log for detections (one JSON object per line).
   detections_log: "data/logs/detections.log"
@@ -423,3 +427,23 @@ retention:
   # Minimum hours between VACUUM passes (reclaims space DELETE alone
   # leaves behind — rewrites the whole file, so it's deliberately rare).
   vacuum_interval_hours: 24
+
+# ------------------------------------------------------------
+# Retraining (training/retrain.py, training/model_registry.py)
+# ------------------------------------------------------------
+# A separate CLI, not something main.py runs in-process — training is
+# CPU-heavy and bursty, and has no business competing with live packet
+# capture for CPU. See Phase 5 scoping conversation (Aug 2026) and
+# training/retrain.py's module docstring for the full reasoning.
+training:
+  # Directory where versioned model files + metadata are stored
+  # (see training/model_registry.py). Separate from models.model_dir
+  # above, which is unrelated legacy config — not yet consumed by
+  # anything in this retraining flow.
+  models_dir: "models"
+
+  # Minimum number of NEW usable ("llm"-sourced) labelled samples
+  # since the last promoted model before `retrain check`/`run`
+  # considers a retrain due. Tune based on how fast your labelled
+  # sample count actually grows in practice.
+  retrain_sample_threshold: 100
