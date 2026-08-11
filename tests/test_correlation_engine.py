@@ -9,7 +9,7 @@ contract, and the opening-verdict vs. attaching-verdict distinction.
 
 import pytest
 
-from detection.correlation_engine import CorrelationEngine, IncidentStatus, _AGGREGATE_KEY
+from detection.correlation_engine import CorrelationEngine, IncidentStatus, AGGREGATE_KEY
 from detection.evidence import from_anomaly, from_ddos, from_port_scan, from_brute_force, from_llm
 from detection.anomaly import DetectionResult, Verdict
 from detection.ddos_tracker import DDoSCheckResult, DDoSVerdict
@@ -76,7 +76,7 @@ class TestAggregateDDoSBucket:
     def test_ddos_evidence_goes_to_dedicated_key(self, engine):
         ddos = from_ddos(DDoSCheckResult(DDoSVerdict.ATTACK, 10.0, 600, 30), timestamp=100.0)
         incident = engine.add_evidence(ddos)
-        assert incident.key == _AGGREGATE_KEY
+        assert incident.key == AGGREGATE_KEY
 
     def test_multiple_ddos_findings_accumulate_in_same_bucket(self, engine):
         ddos1 = from_ddos(DDoSCheckResult(DDoSVerdict.ATTACK, 10.0, 600, 30), timestamp=100.0)
