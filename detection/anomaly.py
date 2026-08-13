@@ -3,109 +3,31 @@ detection/anomaly.py
 ======================
 Unsupervised anomaly detection using Isolation Forest.
 
-This is the first real "AI" component in the pipeline. Everything
-before this (capture, flow assembly, feature extraction) was pure
-measurement — this module is what actually looks at the numbers and
-decides whether a flow looks normal or suspicious.
+Lifecycle: WARM-UP (buffer first `warmup_flows` flows, no verdicts)
+-> FIT (train IsolationForest + StandardScaler once) -> PREDICT
+(score every flow after that against configured thresholds).
 
-How it works (high level):
-----------------------------
-Isolation Forest works by trying to "isolate" each data point with
-random splits. Points that are easy to isolate (few splits needed)
-are outliers — anomalies. Points that are hard to isolate (need many
-splits, because they're surrounded by similar points) are normal.
-
-This requires NO labelled attack data. It only needs to see enough
-normal traffic to learn what "normal" looks like — anything that
-doesn't fit that shape gets flagged.
-
-Lifecycle:
------------
-1. WARM-UP: the first `warmup_flows` feature vectors are collected
-   silently. No verdicts are given yet — we don't know what "normal"
-   looks like until we've seen enough of it.
-2. FIT: once warm-up completes, an IsolationForest is trained once on
-   the warm-up data and a StandardScaler is fit alongside it.
-3. PREDICT: every flow after that gets a verdict (NORMAL / SUSPICIOUS
-   / ATTACK) based on its anomaly score against the configured
-   thresholds.
-
-Design decision — the model does NOT keep learning after warm-up:
---------------------------------------------------------------------
-Once trained, this detector's "sense of normal" stays fixed. It is
-NOT continuously retrained on live traffic. This is a deliberate
-security choice: a detector that keeps adapting automatically could
-be slowly poisoned by an attacker who probes persistently and
-patiently, training the model to think their attack pattern is
-normal. Formal retraining (with evaluation, versioning, and rollback)
-is handled separately and deliberately in Phase 5's pipeline.
-
-Design decision — removing constant (zero-variance) features per-fit:
---------------------------------------------------------------------
-Real-world testing (Phase 1, June 2026) found that flood-style
-attacks (very high packet rate, very uniform low inter-arrival time)
-scored as only weakly anomalous despite being extreme outliers in raw
-feature terms (z-scores over 1000 on rate-related features). Root
-cause, confirmed by direct investigation: many features are constant
-(zero variance) for a given protocol during warm-up — e.g. all TCP
-flag counts are 0 for a pure-ICMP warm-up period. Isolation Forest
-selects features to split on at random per tree; when a large
-fraction of features carry no information, many splits get "wasted"
-on useless features, lengthening average path lengths for ALL points
-(including genuine outliers) and compressing the overall score range.
-
-Fix (confirmed via direct testing, results in docs/performance.md):
-constant features (zero variance in the warm-up data) are excluded
-from the vector handed to IsolationForest entirely, and n_estimators
-is increased from the sklearn default of 100 to 500. Together these
-roughly doubled the score separation between normal traffic and a
-genuine flood in testing, at an acceptable real-time cost (each
-prediction still takes low tens of milliseconds, comfortably within
-budget for a multi-second flow window).
-
-Design decision — Isolation Forest alone can never produce ATTACK:
---------------------------------------------------------------------
-Earlier versions of this module let a sufficiently negative Isolation
-Forest score flag a flow as ATTACK directly, on the model's raw score
-alone. Real-world testing (July 2026) showed this causes frequent,
-confident-looking false alarms on completely ordinary traffic: with
-`contamination` set to any non-zero value, the model is explicitly
-tuned to always flag roughly that fraction of flows as outliers, even
-on a network with zero real attacks happening. A single DNS lookup or
-mDNS broadcast that merely looks slightly different from its
-neighbours in a small warm-up sample would get labelled ATTACK with
-no actual evidence of malicious behaviour behind it.
-
-This matters beyond cosmetics: in any deployment where verdicts drive
-alerting or (eventually, Phase 3+) automated blocking, this kind of
-false alarm causes real alert fatigue and risks disrupting legitimate
-traffic. The fix: the Isolation Forest's score can now only ever
-produce, at most, SUSPICIOUS — "statistically unusual, worth a second
-look." The only two ways a flow's *detector-level* verdict becomes
-ATTACK are the deterministic flood-rate guard below (rule-based,
-not a model opinion), or downstream promotion once the LLM analyser
-(detection/llm_analyser.py, invoked from pipeline/labeller.py)
-independently confirms a genuine attack pattern in the flow's actual
-features. The statistical model's opinion and a confirmed finding are
-deliberately kept distinct rather than conflated under one label.
-
-Design decision — minimum packet floor on the flood-rate guard:
---------------------------------------------------------------------
-Real-world testing (July 2026) found the flood guard itself producing
-false alarms on very short, low-packet-count flows: a 2-packet flow
-with ~1ms between packets computes to a packets_per_second rate in
-the thousands — comfortably over FLOOD_PACKETS_PER_SECOND_THRESHOLD —
-despite being completely ordinary traffic (e.g. a fast request/
-response pair, or a quick handshake exchange). Rate is a meaningless,
-noisy measurement over such a short window and tiny packet count; a
-real flood is characterised by SUSTAINED high-rate volume, not by two
-packets landing close together by chance. FLOOD_MIN_PACKETS adds a
-floor: the flood guard is only evaluated at all once a flow has
-accumulated enough packets for its rate to be a meaningful signal.
-Below that floor, a flow can still be caught by the Isolation Forest
-(as SUSPICIOUS, per the design decision above) or by an LLM
-confirming a real pattern — it just can't trip the deterministic
-flood rule from noise alone.
+Key design decisions (see docs/performance.md for the incidents/data
+behind each):
+- Model does NOT retrain on live traffic after warm-up — avoids an
+  attacker slowly poisoning "normal" via patient probing. Formal
+  retraining is Phase 5's separate, versioned pipeline.
+- Constant (zero-variance) warm-up features are dropped before
+  fitting, and n_estimators=500 (up from sklearn's default 100).
+  Without this, flood traffic scored only weakly anomalous — wasted
+  splits on uninformative constant columns compressed the whole score
+  range. MIN_SURVIVING_COLUMNS is a fallback floor for when warm-up
+  traffic is too uniform for strict filtering to leave enough signal.
+- Isolation Forest's score alone can never produce ATTACK, only
+  SUSPICIOUS — raw IF scores caused frequent false alarms on ordinary
+  traffic (contamination> 0 always flags some fraction as outliers).
+  ATTACK only comes from the flood-rate guard below (deterministic)
+  or downstream LLM confirmation (pipeline/labeller.py).
+  self.attack_threshold is kept for config/schema compatibility and
+  as a reference value, but is intentionally not a branch condition.
+- Flood-rate guard requires FLOOD_MIN_PACKETS before evaluating rate
+  — rate over very few packets is noise (e.g. 2 packets 1ms apart
+  computes to ~2000 pkts/sec despite being ordinary traffic).
 """
 
 from __future__ import annotations
@@ -501,12 +423,9 @@ class AnomalyDetector:
             # flows where packets/duration is a noisy, meaningless
             # rate (e.g. 2 packets 1ms apart computing to ~2000/sec).
             verdict = Verdict.ATTACK
-        elif score < self.attack_threshold or score < self.suspicious_threshold:
-            # A statistically severe (< attack_threshold) or moderate
-            # (< suspicious_threshold) outlier per Isolation Forest —
-            # either way, only ever SUSPICIOUS at this stage. The
-            # model's opinion alone is not evidence of an actual
-            # attack; see module docstring.
+        elif score < self.suspicious_threshold:
+            # attack_threshold is deliberately unused here — IF alone
+            # never produces ATTACK (see module docstring).
             verdict = Verdict.SUSPICIOUS
         else:
             verdict = Verdict.NORMAL
