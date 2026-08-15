@@ -60,3 +60,6 @@ Thumbs.db
 # --- Top-level logs folder (structured event logs) ---
 logs/*
 !logs/.gitkeep
+
+# --- Test output logs ---
+*.log
