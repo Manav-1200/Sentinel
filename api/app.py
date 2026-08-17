@@ -1,47 +1,25 @@
 """
 api/app.py
 
-Read-only-plus-actions REST API over Sentinel's incidents - the layer
-the future dashboard will actually talk to, instead of reaching into
-SQLite or the in-memory CorrelationEngine directly. Built now,
-deliberately BEFORE the dashboard, so the dashboard is a client of a
-real API from day one rather than something built against direct DB
-access that then has to be redone once an API exists anyway.
+REST API over Sentinel's incidents - what the dashboard talks to
+instead of reaching into SQLite/CorrelationEngine directly. Built
+before the dashboard so the dashboard is a real API client from day
+one.
 
-Why FastAPI:
-------------
-Auto-generates interactive API docs (Swagger UI at /docs) directly
-from the type hints and Pydantic models below - genuinely useful here
-specifically because there's no API experience to lean on yet: the
-docs UI becomes a working test client with zero extra code.
+FastAPI: auto-generates Swagger docs at /docs, useful as a free test
+client while there's no other API tooling yet.
 
-Why the CorrelationEngine is a constructor argument, not a global:
---------------------------------------------------------------------
-create_app(correlation_engine) takes the engine as a parameter rather
-than importing/constructing one internally, for two reasons:
-  1. Testability - tests can build a CorrelationEngine, populate it
-     with known Evidence, and test the API against that exact state,
-     with no need to spin up a real capture pipeline.
-  2. Correctness - there must be exactly ONE CorrelationEngine per
-     running Sentinel process (the same one main.py's per-flow loop
-     and pipeline/labeller.py's store_evidence() already share - see
-     detection/correlation_engine.py and pipeline/labeller.py). If
-     this module constructed its own engine internally, the API would
-     silently see a DIFFERENT, always-empty engine instead of the
-     live one main.py is actually populating.
+create_app(correlation_engine) takes the engine as a constructor arg
+rather than a global, so (1) tests can build an isolated engine and
+populate known Evidence, and (2) there must be exactly one
+CorrelationEngine per process - main.py's capture loop and
+labeller.py already share one; constructing a second here would
+silently show an always-empty engine.
 
-IMPORTANT - deployment assumption not yet wired into main.py:
---------------------------------------------------------------------
-For the API to reflect real-time incidents, it must run IN THE SAME
-PROCESS as the capture loop, sharing the actual live CorrelationEngine
-object (e.g. started in a background thread from run_live_capture/
-run_pcap) - NOT as a separate process reading a stale snapshot. That
-wiring (starting uvicorn alongside the capture loop) is intentionally
-NOT done in this file - this module only builds the API itself,
-testable in isolation. Wiring main.py to actually launch it is a
-follow-up integration step, same pattern as evidence.py/
-correlation_engine.py/risk_engine.py were each built and tested
-standalone before being wired in.
+NOTE: for the API to reflect real-time incidents it must run in the
+same process as the capture loop (e.g. uvicorn on a background thread
+from main.py), sharing the live engine - this module only builds the
+API itself; wiring it into main.py is separate.
 """
 
 from __future__ import annotations
@@ -76,9 +54,8 @@ class RiskOut(BaseModel):
 
 
 class IncidentSummaryOut(BaseModel):
-    """Shape returned by the list endpoint - deliberately lighter than
-    IncidentDetailOut (no full evidence list) since a dashboard's
-    incident list view needs an at-a-glance summary, not everything."""
+    """Lighter than IncidentDetailOut (no evidence list) - a list view
+    needs an at-a-glance summary, not everything."""
     incident_id: str
     key: str
     status: str
@@ -91,8 +68,7 @@ class IncidentSummaryOut(BaseModel):
 
 
 class IncidentDetailOut(IncidentSummaryOut):
-    """Everything in the summary, plus the full evidence timeline -
-    what a dashboard's single-incident detail view actually needs."""
+    """Summary plus the full evidence timeline, for the detail view."""
     evidence: list[EvidenceOut]
 
 
@@ -103,11 +79,8 @@ class ActionResult(BaseModel):
 
 
 class SummaryOut(BaseModel):
-    """Shape for GET /summary - a dashboard's top-level headline
-    numbers in one call, instead of fetching and locally aggregating
-    every incident just to show three counts. See PHASES.md Phase
-    4.1' - built specifically so detection/tui_dashboard.py's top
-    panel doesn't need incident-list-shaped data at all."""
+    """GET /summary's headline numbers in one call, instead of a
+    client fetching every incident to locally aggregate three counts."""
     open_incident_count: int
     risk_tier_breakdown: dict[str, int]
     blocked_ip_count: int
@@ -137,28 +110,16 @@ def create_app(
     blocker: object = None,
 ) -> FastAPI:
     """
-    Builds the FastAPI app wired to a specific CorrelationEngine
-    instance. See module docstring for why the engine is injected
-    rather than constructed here.
+    require_auth: gates every route but /health behind the X-API-Key
+    check (api/auth.py). Defaults True - only tests/local dev without
+    SENTINEL_API_KEY should pass False; main.py's real wiring never should.
+    Should mirror config.yaml's api.require_auth, not be hardcoded.
 
-    require_auth: gates every route except /health behind the
-    X-API-Key check in api/auth.py. Defaults to True - a deployment
-    has to deliberately opt OUT of auth, not opt in. Set False only
-    for tests/local dev that construct their own CorrelationEngine
-    and don't want to fuss with SENTINEL_API_KEY - main.py's real
-    wiring should never pass False. See config.yaml's `api:` section
-    - this should mirror `api.require_auth` from config, not be
-    hardcoded at the call site.
-
-    blocker: optional response.blocker.IPBlocker instance, used only
-    by GET /summary for blocked_ip_count. Typed as `object` rather
-    than importing IPBlocker directly - response/blocker.py pulls in
-    nftables/iptables subprocess plumbing that has no business being
-    an import-time dependency of the API module, which needs to stay
-    importable (e.g. for tests, or a future read-only API-only
-    deployment) even somewhere blocker.py's system calls wouldn't
-    work. Left None, /summary reports blocked_ip_count as 0 rather
-    than failing - see that route's docstring.
+    blocker: optional IPBlocker, used only by /summary for
+    blocked_ip_count. Typed `object` (not imported directly) so this
+    module stays importable without pulling in nftables/iptables
+    subprocess plumbing. None -> blocked_ip_count reports 0, which is
+    expected for pcap-replay/test runs with no live blocker.
     """
     app = FastAPI(
         title="Sentinel Incidents API",
@@ -166,9 +127,7 @@ def create_app(
         version="0.1.0",
     )
 
-    # Applied per-route below rather than as a single app-wide
-    # dependency, specifically so /health can stay exempt (see
-    # api/auth.py's module docstring for why).
+    # Applied per-route (not app-wide) so /health can stay exempt.
     auth_deps = [require_auth_dependency] if require_auth else []
 
     @app.get("/health")
@@ -177,24 +136,9 @@ def create_app(
 
     @app.get("/summary", response_model=SummaryOut, dependencies=auth_deps)
     def summary():
-        """
-        Headline numbers for a dashboard's top-level view - see
-        SummaryOut's docstring for why this exists as its own route
-        instead of making every client fetch /incidents and aggregate
-        it locally.
-
-        risk_tier_breakdown only counts OPEN incidents (a resolved
-        incident's risk tier isn't part of "what's the state of things
-        right now"), keyed by RiskTier's string values so every tier
-        is always present in the response (0 for tiers with no open
-        incidents) rather than a client having to handle a
-        possibly-missing key.
-
-        blocked_ip_count is 0 if this app was built without a blocker
-        (blocker=None) - see create_app's docstring. Not an error
-        condition: a pcap-replay run or a test harness legitimately
-        has no live blocker to report on.
-        """
+        """risk_tier_breakdown only counts OPEN incidents, keyed by
+        every RiskTier value (0 for tiers with none) so clients never
+        need to handle a missing key."""
         open_incidents = correlation_engine.open_incidents()
 
         tier_breakdown = {tier.value: 0 for tier in RiskTier}
@@ -211,22 +155,14 @@ def create_app(
 
     @app.get("/incidents", response_model=list[IncidentSummaryOut], dependencies=auth_deps)
     def list_incidents(include_resolved: bool = False):
-        """
-        Lists incidents. By default only OPEN incidents (the common
-        case - "what's actively going on right now") - pass
-        ?include_resolved=true for the full history.
-        """
+        """Only OPEN by default - pass ?include_resolved=true for full history."""
         incidents = correlation_engine.all_incidents() if include_resolved else correlation_engine.open_incidents()
         return [_to_summary(i, assess_risk(i)) for i in incidents]
 
     @app.get("/incidents/{key}", response_model=IncidentDetailOut, dependencies=auth_deps)
     def get_incident(key: str):
-        """
-        Full detail for one incident - `key` is the src_ip an incident
-        is grouped on, or the literal string "__aggregate__" for the
-        one permanent DDoS bucket (see correlation_engine.py's
-        AGGREGATE_KEY).
-        """
+        """`key` is the src_ip an incident is grouped on, or
+        "__aggregate__" for the DDoS bucket (see correlation_engine.py)."""
         incident = correlation_engine.get_incident(key)
         if incident is None:
             raise HTTPException(status_code=404, detail=f"No incident found for key '{key}'")
